@@ -3,10 +3,20 @@
   "name": "locale-manager",
   "compatibility_date": "2026-09-05",
   "main": "./worker/index.ts",
+
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": [
       "/api/*"
     ]
-  }
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "locale-manager-db",
+      "database_id": "local-development",
+      "preview_database_id": "local-development"
+    }
+  ]
 }
