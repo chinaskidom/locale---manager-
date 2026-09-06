@@ -1,6 +1,7 @@
 import {
   addMemberToDraftMonth,
   createMonth as insertMonth,
+  getAllMonths,
   getMonthCalculationData,
   getMonthDetail as selectMonthDetail,
   getMonthStatus,
@@ -23,6 +24,10 @@ import {
   MonthNotFoundError,
   MonthNotPublishableError,
 } from '../errors/months'
+
+export function listMonths(db: D1Database): Promise<Month[]> {
+  return getAllMonths(db)
+}
 
 export async function getMonthDetail(
   db: D1Database,

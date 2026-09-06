@@ -65,6 +65,59 @@ describe('months (local D1)', () => {
     return db.prepare('SELECT * FROM months WHERE id = ?').bind(monthId).first<Month>()
   }
 
+  it('returns HTTP 200 with an empty month list', async () => {
+    const response = await worker.fetch(new Request('https://example.com/api/months'), { DB: db })
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toContain('application/json')
+    expect(await response.json()).toEqual([])
+  })
+
+  it('lists only persisted month fields over HTTP, newest year/month first', async () => {
+    const september = await seedMonth(2)
+    const january = await createDraftMonth(db, { year: 2027, month: 1, billAmountEuros: 0 })
+    const december = await createDraftMonth(db, { year: 2026, month: 12, billAmountEuros: 100 })
+
+    // Stored quotas deliberately differ from fresh allocations to detect recalculation.
+    await db.batch([
+      db.prepare(`
+        UPDATE months
+        SET status = 'PUBLISHED', per_member_amount_cents = 4321, published_at = '2026-12-02 10:00:00'
+        WHERE id = ?
+      `).bind(december.id),
+      db.prepare(`
+        UPDATE months
+        SET status = 'CLOSED', per_member_amount_cents = 1234,
+          published_at = '2026-09-02 10:00:00', closed_at = '2026-09-30 18:00:00'
+        WHERE id = ?
+      `).bind(september.id),
+    ])
+
+    const response = await worker.fetch(new Request('https://example.com/api/months'), { DB: db })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual([
+      january,
+      { ...december, status: 'PUBLISHED', per_member_amount_cents: 4321, published_at: '2026-12-02 10:00:00' },
+      {
+        ...september,
+        status: 'CLOSED',
+        per_member_amount_cents: 1234,
+        published_at: '2026-09-02 10:00:00',
+        closed_at: '2026-09-30 18:00:00',
+      },
+    ])
+  })
+
+  it('propagates D1 failures from month listing rather than returning an empty list', async () => {
+    const failingDb = {
+      prepare: () => db.prepare('SELECT * FROM missing_months_table'),
+    } as unknown as D1Database
+
+    await expect(worker.fetch(new Request('https://example.com/api/months'), { DB: failingDb }))
+      .rejects.toThrow('no such table: missing_months_table')
+  })
+
   it.each([0, 2])('returns HTTP detail for a DRAFT with %i participants and no official quota', async (memberCount) => {
     const month = await seedMonth(memberCount)
     const response = await worker.fetch(new Request(

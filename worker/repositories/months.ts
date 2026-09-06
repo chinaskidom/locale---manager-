@@ -1,5 +1,26 @@
 import type { Month, MonthDetail, MonthParticipant, MonthStatus } from '../types'
 
+export async function getAllMonths(db: D1Database): Promise<Month[]> {
+  const result = await db.prepare(`
+    SELECT
+      id,
+      year,
+      month,
+      bill_amount_cents,
+      fixed_amount_cents,
+      per_member_amount_cents,
+      status,
+      due_date,
+      created_at,
+      published_at,
+      closed_at
+    FROM months
+    ORDER BY year DESC, month DESC
+  `).all<Month>()
+
+  return result.results
+}
+
 export async function getMonthDetail(
   db: D1Database,
   monthId: number,

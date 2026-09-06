@@ -19,6 +19,7 @@ import {
   publishMonthAmount,
   excludeMemberFromMonth,
   includeMemberInMonth,
+  listMonths,
 } from './services/months'
 
 interface Env {
@@ -50,6 +51,13 @@ export default {
       const members = await getAllMembers(env.DB)
 
       return Response.json(members)
+    }
+
+    if (
+      url.pathname === '/api/months' &&
+      request.method === 'GET'
+    ) {
+      return Response.json(await listMonths(env.DB))
     }
 
     const monthMatch = url.pathname.match(/^\/api\/months\/([^/]+)$/)
