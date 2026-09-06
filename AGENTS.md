@@ -1,5 +1,9 @@
 # Repository Guidance
 
+## Product Requirements
+
+- `PRODUCT.md` contains authoritative product requirements. Read it before planning features or making product-level decisions; do not invent requirements absent from it.
+
 ## Project Status
 
 - Read `STATUS.md` at the start of every new session.
