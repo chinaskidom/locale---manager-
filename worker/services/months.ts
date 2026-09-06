@@ -79,19 +79,22 @@ export async function publishMonthAmount(
     throw new MonthHasNoMembersError()
   }
 
-  const perMemberAmountCents = calculatePerMemberAmount(
+  // Preserve validation, but let the publishing SQL calculate the persisted amount.
+  calculatePerMemberAmount(
     month.fixed_amount_cents,
     month.bill_amount_cents,
     month.member_count,
   )
 
-  const published = await publishMonth(
-    db,
-    monthId,
-    perMemberAmountCents,
-  )
+  const perMemberAmountCents = await publishMonth(db, monthId)
 
-  if (!published) {
+  if (perMemberAmountCents === null) {
+    const currentMonth = await getMonthCalculationData(db, monthId)
+
+    if (currentMonth?.status === 'DRAFT' && currentMonth.member_count === 0) {
+      throw new MonthHasNoMembersError()
+    }
+
     throw new MonthNotPublishableError()
   }
 

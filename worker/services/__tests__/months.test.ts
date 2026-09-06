@@ -80,7 +80,7 @@ describe('publishMonthAmount', () => {
     vi.spyOn(
       monthsRepository,
       'publishMonth',
-    ).mockResolvedValue(false)
+    ).mockResolvedValue(null)
 
     await expect(
       publishMonthAmount(
@@ -119,6 +119,60 @@ describe('publishMonthAmount', () => {
     )
 
     expect(publishSpy).not.toHaveBeenCalled()
+  })
+
+  it.each([7600, 0])('returns the persisted amount %i rather than the precheck calculation', async (amount) => {
+    vi.spyOn(monthsRepository, 'getMonthCalculationData').mockResolvedValue({
+      id: 1,
+      fixed_amount_cents: 12000,
+      bill_amount_cents: 3200,
+      member_count: 3,
+      status: 'DRAFT',
+    })
+    const publishSpy = vi.spyOn(monthsRepository, 'publishMonth').mockResolvedValue(amount)
+    const db = {} as D1Database
+
+    await expect(publishMonthAmount(db, 1)).resolves.toBe(amount)
+    expect(publishSpy).toHaveBeenCalledWith(db, 1)
+  })
+
+  it.each([
+    { fixed_amount_cents: 12000.5, bill_amount_cents: 3200 },
+    { fixed_amount_cents: 12000, bill_amount_cents: 3200.5 },
+  ])('preserves validation of stored cents: %o', async (amounts) => {
+    vi.spyOn(monthsRepository, 'getMonthCalculationData').mockResolvedValue({
+      id: 1,
+      ...amounts,
+      member_count: 3,
+      status: 'DRAFT',
+    })
+    const publishSpy = vi.spyOn(monthsRepository, 'publishMonth')
+
+    await expect(publishMonthAmount({} as D1Database, 1)).rejects.toThrow('amounts must be non-negative integers')
+    expect(publishSpy).not.toHaveBeenCalled()
+  })
+
+  it.each(['DRAFT', 'PUBLISHED'] as const)('rechecks an empty %s month after the SQL publication guard fails', async (status) => {
+    vi.spyOn(monthsRepository, 'getMonthCalculationData')
+      .mockResolvedValueOnce({
+        id: 1,
+        fixed_amount_cents: 12000,
+        bill_amount_cents: 3200,
+        member_count: 1,
+        status: 'DRAFT',
+      })
+      .mockResolvedValueOnce({
+        id: 1,
+        fixed_amount_cents: 12000,
+        bill_amount_cents: 3200,
+        member_count: 0,
+        status,
+      })
+    vi.spyOn(monthsRepository, 'publishMonth').mockResolvedValue(null)
+
+    await expect(publishMonthAmount({} as D1Database, 1)).rejects.toBeInstanceOf(
+      status === 'DRAFT' ? MonthHasNoMembersError : MonthNotPublishableError,
+    )
   })
 
   it('throws MonthNotFoundError when the month does not exist', async () => {

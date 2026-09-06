@@ -39,22 +39,34 @@ export async function getMonthCalculationData(
 export async function publishMonth(
   db: D1Database,
   monthId: number,
-  perMemberAmountCents: number,
-): Promise<boolean> {
+): Promise<number | null> {
+  // Count and calculate in the publishing write, rounding up with integer division.
   const result = await db
     .prepare(`
+      WITH membership AS (
+        SELECT COUNT(*) AS member_count
+        FROM month_members
+        WHERE month_id = ?
+      )
       UPDATE months
       SET
-        per_member_amount_cents = ?,
+        per_member_amount_cents = (
+          SELECT (fixed_amount_cents + bill_amount_cents + member_count - 1) / member_count
+          FROM membership
+        ),
         status = 'PUBLISHED',
         published_at = CURRENT_TIMESTAMP
       WHERE id = ?
         AND status = 'DRAFT'
+        AND (SELECT member_count FROM membership) > 0
+      RETURNING per_member_amount_cents
     `)
-    .bind(perMemberAmountCents, monthId)
-    .run()
+    .bind(monthId, monthId)
+    .all<{ per_member_amount_cents: number }>()
 
   return result.meta.changes === 1
+    ? result.results[0].per_member_amount_cents
+    : null
 }
 
 export interface CreateMonthData {

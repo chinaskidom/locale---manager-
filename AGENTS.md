@@ -1,11 +1,22 @@
 # Repository Guidance
 
+## Project Status
+
+- Read `STATUS.md` at the start of every new session.
+- After successfully completing a development task, update `STATUS.md`.
+- Keep it concise and factual.
+- Record what was completed, important unresolved issues, and the single next planned task.
+- Do not invent roadmap items or change product requirements.
+- Do not mark work as completed unless the implementation and relevant verification succeeded.
+- Do not commit or push unless explicitly asked.
+
 ## Commands
 
 - Use npm (`npm ci`; lockfile is `package-lock.json`). Node 24.x satisfies the locked toolchain; Node 20 does not satisfy Vitest/Wrangler requirements.
 - Before database-backed development, run `npx wrangler d1 migrations apply locale-manager-db --local`, then `npm run dev`. The Cloudflare Vite plugin runs the SPA and Worker together; no separate API server is needed.
 - Verification: `npm run lint`, `npm test`, and `npm run build`. Build runs `tsc -b` across the app, Vite config, and Worker projects before producing `dist/client` and `dist/locale_manager`. For typechecking alone, use `npx tsc -b`.
-- Focused tests: `npm test -- worker/services/__tests__/months.test.ts`; append `-t "calculatePerMemberAmount"` to select that suite. Existing tests mock repository calls and need no D1 setup; they do not exercise HTTP routing, SQL, or migration triggers.
+- Focused unit tests: `npm test -- worker/services/__tests__/months.test.ts`; append `-t "calculatePerMemberAmount"` to select that suite. These tests mock repository calls and need no D1 setup.
+- SQL-backed tests: `npm test -- worker/services/__tests__/months.sql.test.ts`. These use isolated, nonpersistent local D1 with real migrations and need no manual D1 setup. Current tests do not exercise HTTP routing.
 - Regenerate `worker-configuration.d.ts` with `npx wrangler types` after changing bindings or runtime configuration in `wrangler.jsonc`; do not hand-edit the generated declarations.
 - D1 is bound as `env.DB`. Both database IDs in `wrangler.jsonc` are `local-development` placeholders, not deployable remote database IDs. Keep local database commands explicitly `--local`.
 - `.wrangler/state/` contains tracked runtime databases, including SQLite WAL/SHM files. Local tooling can dirty them; keep incidental runtime-state changes out of code/documentation commits.
