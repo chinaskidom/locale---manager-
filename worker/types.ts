@@ -35,3 +35,14 @@ export interface MonthMember {
   payment_status: PaymentStatus
   paid_at: string | null
 }
+
+export interface MonthParticipant {
+  member_id: number
+  name: string
+  payment_status: PaymentStatus
+  paid_at: string | null
+}
+
+export interface MonthDetail extends Month {
+  participants: MonthParticipant[]
+}

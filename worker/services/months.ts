@@ -2,13 +2,14 @@ import {
   addMemberToDraftMonth,
   createMonth as insertMonth,
   getMonthCalculationData,
+  getMonthDetail as selectMonthDetail,
   getMonthStatus,
   isMemberInMonth,
   publishMonth,
   removeMemberFromDraftMonth,
 } from '../repositories/months'
 import { getMemberActiveStatus } from '../repositories/members'
-import type { Month } from '../types'
+import type { Month, MonthDetail } from '../types'
 import {
   InvalidMonthInputError,
   MemberAlreadyInMonthError,
@@ -22,6 +23,19 @@ import {
   MonthNotFoundError,
   MonthNotPublishableError,
 } from '../errors/months'
+
+export async function getMonthDetail(
+  db: D1Database,
+  monthId: number,
+): Promise<MonthDetail> {
+  const month = await selectMonthDetail(db, monthId)
+
+  if (!month) {
+    throw new MonthNotFoundError()
+  }
+
+  return month
+}
 
 export function calculatePerMemberAmount(
   fixedAmountCents: number,

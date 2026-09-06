@@ -1,4 +1,40 @@
-import type { Month, MonthStatus } from '../types'
+import type { Month, MonthDetail, MonthParticipant, MonthStatus } from '../types'
+
+export async function getMonthDetail(
+  db: D1Database,
+  monthId: number,
+): Promise<MonthDetail | null> {
+  // A single batch keeps the month and participation reads in the same transaction.
+  const [months, participants] = await db.batch([
+    db.prepare(`
+      SELECT
+        id,
+        year,
+        month,
+        bill_amount_cents,
+        fixed_amount_cents,
+        per_member_amount_cents,
+        status,
+        due_date,
+        created_at,
+        published_at,
+        closed_at
+      FROM months
+      WHERE id = ?
+    `).bind(monthId),
+    db.prepare(`
+      SELECT mm.member_id, m.name, mm.payment_status, mm.paid_at
+      FROM month_members mm
+      JOIN members m ON m.id = mm.member_id
+      WHERE mm.month_id = ?
+      ORDER BY m.name, mm.member_id
+    `).bind(monthId),
+  ]) as [D1Result<Month>, D1Result<MonthParticipant>]
+
+  const month = months.results[0]
+
+  return month ? { ...month, participants: participants.results } : null
+}
 
 export interface MonthCalculationData {
   id: number

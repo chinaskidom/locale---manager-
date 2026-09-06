@@ -15,10 +15,32 @@ import {
   publishMonthAmount,
   createDraftMonth,
   excludeMemberFromMonth,
+  getMonthDetail,
   includeMemberInMonth,
 } from '../months'
 import * as membersRepository from '../../repositories/members'
 import * as monthsRepository from '../../repositories/months'
+
+describe('getMonthDetail', () => {
+  const db = {} as D1Database
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('throws MonthNotFoundError when the repository returns no month', async () => {
+    vi.spyOn(monthsRepository, 'getMonthDetail').mockResolvedValue(null)
+
+    await expect(getMonthDetail(db, 999)).rejects.toBeInstanceOf(MonthNotFoundError)
+  })
+
+  it('propagates database failures rather than reporting a missing month', async () => {
+    const error = new Error('database unavailable')
+    vi.spyOn(monthsRepository, 'getMonthDetail').mockRejectedValue(error)
+
+    await expect(getMonthDetail(db, 1)).rejects.toBe(error)
+  })
+})
 
 describe('calculatePerMemberAmount', () => {
   it('rounds the per-member amount up to the next cent', () => {

@@ -15,6 +15,7 @@ import { getAllMembers } from './repositories/members'
 import {
   calculateMonthAmount,
   createDraftMonth,
+  getMonthDetail,
   publishMonthAmount,
   excludeMemberFromMonth,
   includeMemberInMonth,
@@ -49,6 +50,34 @@ export default {
       const members = await getAllMembers(env.DB)
 
       return Response.json(members)
+    }
+
+    const monthMatch = url.pathname.match(/^\/api\/months\/([^/]+)$/)
+
+    if (monthMatch && request.method === 'GET') {
+      const monthId = /^\d+$/.test(monthMatch[1])
+        ? parsePositiveId(monthMatch[1])
+        : null
+
+      if (monthId === null) {
+        return Response.json(
+          { error: 'invalid month id' },
+          { status: 400 },
+        )
+      }
+
+      try {
+        return Response.json(await getMonthDetail(env.DB, monthId))
+      } catch (error) {
+        if (error instanceof MonthNotFoundError) {
+          return Response.json(
+            { error: error.message },
+            { status: 404 },
+          )
+        }
+
+        throw error
+      }
     }
 
     const calculationMatch = url.pathname.match(

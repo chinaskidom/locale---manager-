@@ -2,23 +2,25 @@
 
 ## Last completed work
 
-- Implemented DRAFT-only member inclusion/re-inclusion via `POST /api/months/:monthId/members/:memberId`, reusing the existing SQL guards and affected-row check. Missing, inactive, and duplicate members have distinct domain errors; concurrent inclusion/exclusion diagnosis has a shared domain conflict.
-- Added 10 service unit cases and 22 local-D1 regression cases covering persistence guards, inclusion/exclusion races, and membership HTTP semantics. Updated the publication/inclusion ordering test to use the new service.
-- Verification passed: `npm run lint`, `npm test` (71 tests), `npm run build`, and `git diff --check`.
+- Implemented `GET /api/months/:monthId` through repository, service, and HTTP layers. One D1 batch returns persisted month fields and month-specific participants, including globally inactive members, without exposing emails or recalculating the official quota. Invalid IDs return 400; a typed missing-month error maps to 404.
+- Added 3 service unit cases and 13 local-D1/HTTP cases covering response shape, empty drafts, PUBLISHED/CLOSED stored quotas and timestamps, payment fields, historical participation, read-only behavior, and errors.
+- Verification passed: `npm run lint`, `npm test` (94 tests), `npm run build`, and `git diff --check`.
 
 ## Important unresolved issues
 
 - Direct SQL writes that bypass guarded repository statements can still modify published membership; no schema-wide guard was added.
 - Failure diagnosis reads current state after a guarded no-op; concurrent changes can obscure the original cause and return a membership conflict.
-- Lower priority: HTTP tests cover membership routes only; deployed D1 remains untested.
-- Lower priority: the frontend has no API integration, and deployment D1 IDs remain local-development placeholders.
+- HTTP tests cover membership and month-detail routes; other endpoint HTTP coverage and deployed D1 verification remain missing.
+- Authentication/admin authorization and frontend API integration are missing; deployment D1 IDs remain local-development placeholders.
+- The business rule for closing a PUBLISHED month remains undecided.
 
 ## Current state
 
-- Backend endpoints support health checks, member listing, draft-month creation, allocation calculation, publication, and DRAFT-only member inclusion/re-inclusion and exclusion, with request validation and domain-error responses.
+- Backend endpoints support health checks, member listing, month detail, draft-month creation, allocation calculation, publication, and DRAFT-only member inclusion/re-inclusion and exclusion, with request validation and domain-error responses.
 - Draft creation converts whole-euro bills to cents, defaults the fixed charge to 12000 cents, sets the due date to the 21st, and snapshots active members through a database trigger. Allocation uses month-specific membership and rounds up to integer cents.
 - Publication atomically counts membership, calculates the stored allocation, and publishes only a nonempty DRAFT. Membership writes retain SQL-level DRAFT guards; inclusion also requires an existing, globally active member and prevents duplicates.
+- Month participation stores PAID/UNPAID and paid_at with consistency constraints. Month detail exposes these fields; payment mutations are not implemented.
 
 ## Next planned task
 
-No subsequent task is documented in the existing project plan; awaiting prioritization.
+Implement month listing (`GET /api/months`) using persisted month fields, with focused local-D1/HTTP tests.

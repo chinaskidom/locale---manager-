@@ -65,6 +65,91 @@ describe('months (local D1)', () => {
     return db.prepare('SELECT * FROM months WHERE id = ?').bind(monthId).first<Month>()
   }
 
+  it.each([0, 2])('returns HTTP detail for a DRAFT with %i participants and no official quota', async (memberCount) => {
+    const month = await seedMonth(memberCount)
+    const response = await worker.fetch(new Request(
+      `https://example.com/api/months/${month.id}`,
+    ), { DB: db })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      ...month,
+      participants: Array.from({ length: memberCount }, (_, index) => ({
+        member_id: index + 1,
+        name: `Member ${index + 1}`,
+        payment_status: 'UNPAID',
+        paid_at: null,
+      })),
+    })
+    expect(await storedMonth(month.id)).toEqual(month)
+  })
+
+  it.each(['PUBLISHED', 'CLOSED'] as const)('returns persisted %s detail with only month-specific participant fields', async (status) => {
+    const month = await seedMonth(3)
+    await excludeMemberFromMonth(db, month.id, 3)
+    await publishMonthAmount(db, month.id)
+    const publishedAt = '2026-09-02 10:00:00'
+    const closedAt = status === 'CLOSED' ? '2026-09-30 18:00:00' : null
+    const paidAt = '2026-09-21 12:34:56'
+
+    // A distinct persisted quota makes accidental recalculation observable.
+    await db.prepare(`
+      UPDATE months
+      SET status = ?, per_member_amount_cents = 4321, published_at = ?, closed_at = ?
+      WHERE id = ?
+    `).bind(status, publishedAt, closedAt, month.id).run()
+    await db.prepare('UPDATE members SET is_active = 0 WHERE id = 1').run()
+    await db.prepare("INSERT INTO members (id, name, email) VALUES (4, 'Later member', 'later@example.com')").run()
+    const otherMonth = await createDraftMonth(db, { year: 2026, month: 10, billAmountEuros: 0 })
+    await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = ? WHERE month_id = ? AND member_id = 1")
+      .bind(paidAt, month.id).run()
+    await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = ? WHERE month_id = ? AND member_id = 2")
+      .bind('2026-10-21 09:00:00', otherMonth.id).run()
+    const beforeMembers = (await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results
+
+    const response = await worker.fetch(new Request(
+      `https://example.com/api/months/${month.id}`,
+    ), { DB: db })
+
+    const expectedMonth = {
+      ...month,
+      status,
+      per_member_amount_cents: 4321,
+      published_at: publishedAt,
+      closed_at: closedAt,
+    }
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      ...expectedMonth,
+      participants: [
+        { member_id: 1, name: 'Member 1', payment_status: 'PAID', paid_at: paidAt },
+        { member_id: 2, name: 'Member 2', payment_status: 'UNPAID', paid_at: null },
+      ],
+    })
+    expect(await storedMonth(month.id)).toEqual(expectedMonth)
+    expect((await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results).toEqual(beforeMembers)
+  })
+
+  it('returns HTTP 404 for a missing month detail', async () => {
+    const response = await worker.fetch(new Request(
+      'https://example.com/api/months/999',
+    ), { DB: db })
+
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({ error: 'month not found' })
+  })
+
+  it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid HTTP detail ID %s before querying D1', async (id) => {
+    const read = vi.spyOn(monthsRepository, 'getMonthDetail')
+    const response = await worker.fetch(new Request(
+      `https://example.com/api/months/${id}`,
+    ), { DB: db })
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: 'invalid month id' })
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('backfills existing participants without changing membership or month amounts', async () => {
     const legacy = await getPlatformProxy<{ DB: D1Database }>({
       configPath: fileURLToPath(new URL('../../../wrangler.jsonc', import.meta.url)),
