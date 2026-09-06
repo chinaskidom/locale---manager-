@@ -1,11 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { MonthNotPublishableError, MonthHasNoMembersError, MonthNotFoundError, MonthNotEditableError, MemberNotInMonthError } from '../../errors/months'
+import {
+  MemberAlreadyInMonthError,
+  MemberNotActiveError,
+  MemberNotFoundError,
+  MemberNotInMonthError,
+  MonthHasNoMembersError,
+  MonthMembershipConflictError,
+  MonthNotEditableError,
+  MonthNotFoundError,
+  MonthNotPublishableError,
+} from '../../errors/months'
 import {
   calculatePerMemberAmount,
   publishMonthAmount,
   createDraftMonth,
   excludeMemberFromMonth,
+  includeMemberInMonth,
 } from '../months'
+import * as membersRepository from '../../repositories/members'
 import * as monthsRepository from '../../repositories/months'
 
 describe('calculatePerMemberAmount', () => {
@@ -337,9 +349,85 @@ describe('createDraftMonth', () => {
   })
 })
 
+describe('includeMemberInMonth', () => {
+  const db = {} as D1Database
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.spyOn(monthsRepository, 'addMemberToDraftMonth').mockResolvedValue(false)
+    vi.spyOn(monthsRepository, 'getMonthStatus').mockResolvedValue('DRAFT')
+    vi.spyOn(membersRepository, 'getMemberActiveStatus').mockResolvedValue(1)
+    vi.spyOn(monthsRepository, 'isMemberInMonth').mockResolvedValue(false)
+  })
+
+  it('succeeds only when the guarded insertion reports a changed row', async () => {
+    vi.mocked(monthsRepository.addMemberToDraftMonth).mockResolvedValue(true)
+
+    await expect(includeMemberInMonth(db, 2, 4)).resolves.toBeUndefined()
+    expect(monthsRepository.addMemberToDraftMonth).toHaveBeenCalledExactlyOnceWith(db, 2, 4)
+    expect(monthsRepository.getMonthStatus).not.toHaveBeenCalled()
+    expect(membersRepository.getMemberActiveStatus).not.toHaveBeenCalled()
+    expect(monthsRepository.isMemberInMonth).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { status: null, error: MonthNotFoundError },
+    { status: 'PUBLISHED', error: MonthNotEditableError },
+    { status: 'CLOSED', error: MonthNotEditableError },
+  ] as const)('diagnoses a no-op for month status $status', async ({ status, error }) => {
+    vi.mocked(monthsRepository.getMonthStatus).mockResolvedValue(status)
+
+    await expect(includeMemberInMonth(db, 2, 4)).rejects.toBeInstanceOf(error)
+    expect(monthsRepository.getMonthStatus).toHaveBeenCalledExactlyOnceWith(db, 2)
+    expect(membersRepository.getMemberActiveStatus).not.toHaveBeenCalled()
+    expect(monthsRepository.addMemberToDraftMonth).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    { activeStatus: null, error: MemberNotFoundError },
+    { activeStatus: 0, error: MemberNotActiveError },
+  ])('diagnoses a missing or inactive member: $error.name', async ({ activeStatus, error }) => {
+    vi.mocked(membersRepository.getMemberActiveStatus).mockResolvedValue(activeStatus)
+
+    await expect(includeMemberInMonth(db, 2, 4)).rejects.toBeInstanceOf(error)
+    expect(membersRepository.getMemberActiveStatus).toHaveBeenCalledExactlyOnceWith(db, 4)
+    expect(monthsRepository.isMemberInMonth).not.toHaveBeenCalled()
+  })
+
+  it('reports an already-included member without retrying the insertion', async () => {
+    vi.mocked(monthsRepository.isMemberInMonth).mockResolvedValue(true)
+
+    await expect(includeMemberInMonth(db, 2, 4)).rejects.toBeInstanceOf(MemberAlreadyInMonthError)
+    expect(monthsRepository.isMemberInMonth).toHaveBeenCalledExactlyOnceWith(db, 2, 4)
+    expect(monthsRepository.addMemberToDraftMonth).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports a domain conflict if current state no longer explains the no-op', async () => {
+    await expect(includeMemberInMonth(db, 2, 4)).rejects.toBeInstanceOf(MonthMembershipConflictError)
+    expect(monthsRepository.addMemberToDraftMonth).toHaveBeenCalledTimes(1)
+  })
+
+  it('propagates unexpected database failures instead of classifying their messages', async () => {
+    const error = new Error('member not found')
+    vi.mocked(monthsRepository.addMemberToDraftMonth).mockRejectedValue(error)
+
+    await expect(includeMemberInMonth(db, 2, 4)).rejects.toBe(error)
+    expect(monthsRepository.getMonthStatus).not.toHaveBeenCalled()
+  })
+})
+
 describe('excludeMemberFromMonth', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+  })
+
+  it('reports a domain conflict when re-inclusion obscures a failed deletion', async () => {
+    vi.spyOn(monthsRepository, 'getMonthStatus').mockResolvedValue('DRAFT')
+    vi.spyOn(monthsRepository, 'isMemberInMonth').mockResolvedValue(true)
+    vi.spyOn(monthsRepository, 'removeMemberFromDraftMonth').mockResolvedValue(false)
+
+    await expect(excludeMemberFromMonth({} as D1Database, 2, 4)).rejects.toBeInstanceOf(MonthMembershipConflictError)
+    expect(monthsRepository.removeMemberFromDraftMonth).toHaveBeenCalledTimes(1)
   })
 
   it('removes an included member from a draft month', async () => {

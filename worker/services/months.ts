@@ -1,4 +1,5 @@
 import {
+  addMemberToDraftMonth,
   createMonth as insertMonth,
   getMonthCalculationData,
   getMonthStatus,
@@ -6,12 +7,17 @@ import {
   publishMonth,
   removeMemberFromDraftMonth,
 } from '../repositories/months'
+import { getMemberActiveStatus } from '../repositories/members'
 import type { Month } from '../types'
 import {
   InvalidMonthInputError,
+  MemberAlreadyInMonthError,
+  MemberNotActiveError,
+  MemberNotFoundError,
   MemberNotInMonthError,
   MonthAlreadyExistsError,
   MonthHasNoMembersError,
+  MonthMembershipConflictError,
   MonthNotEditableError,
   MonthNotFoundError,
   MonthNotPublishableError,
@@ -218,5 +224,43 @@ export async function excludeMemberFromMonth(
     throw new MemberNotInMonthError()
   }
 
-  throw new Error('failed to exclude member from month')
+  throw new MonthMembershipConflictError()
+}
+
+export async function includeMemberInMonth(
+  db: D1Database,
+  monthId: number,
+  memberId: number,
+): Promise<void> {
+  if (await addMemberToDraftMonth(db, monthId, memberId)) {
+    return
+  }
+
+  // The guarded SQL write is authoritative; diagnose a no-op from current state.
+  const status = await getMonthStatus(db, monthId)
+
+  if (status === null) {
+    throw new MonthNotFoundError()
+  }
+
+  if (status !== 'DRAFT') {
+    throw new MonthNotEditableError()
+  }
+
+  const activeStatus = await getMemberActiveStatus(db, memberId)
+
+  if (activeStatus === null) {
+    throw new MemberNotFoundError()
+  }
+
+  if (activeStatus !== 1) {
+    throw new MemberNotActiveError()
+  }
+
+  if (await isMemberInMonth(db, monthId, memberId)) {
+    throw new MemberAlreadyInMonthError()
+  }
+
+  // ponytail: diagnosis can race after the write; use transactional write/diagnosis for exact attribution.
+  throw new MonthMembershipConflictError()
 }

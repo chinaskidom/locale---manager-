@@ -46,3 +46,31 @@ export class MemberNotInMonthError extends Error {
     this.name = 'MemberNotInMonthError'
   }
 }
+
+export class MemberNotFoundError extends Error {
+  constructor() {
+    super('member not found')
+    this.name = 'MemberNotFoundError'
+  }
+}
+
+export class MemberNotActiveError extends Error {
+  constructor() {
+    super('member is not active')
+    this.name = 'MemberNotActiveError'
+  }
+}
+
+export class MemberAlreadyInMonthError extends Error {
+  constructor() {
+    super('member is already included in month')
+    this.name = 'MemberAlreadyInMonthError'
+  }
+}
+
+export class MonthMembershipConflictError extends Error {
+  constructor() {
+    super('month membership conflicted with another change')
+    this.name = 'MonthMembershipConflictError'
+  }
+}

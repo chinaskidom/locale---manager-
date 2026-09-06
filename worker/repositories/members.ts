@@ -1,5 +1,19 @@
 import type { Member } from '../types'
 
+export async function getMemberActiveStatus(
+  db: D1Database,
+  memberId: number,
+): Promise<number | null> {
+  return db
+    .prepare(`
+      SELECT is_active
+      FROM members
+      WHERE id = ?
+    `)
+    .bind(memberId)
+    .first<number>('is_active')
+}
+
 export async function getAllMembers(
   db: D1Database,
 ): Promise<Member[]> {

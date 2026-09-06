@@ -1,7 +1,11 @@
 import {
   InvalidMonthInputError,
+  MemberAlreadyInMonthError,
+  MemberNotActiveError,
+  MemberNotFoundError,
   MonthAlreadyExistsError,
   MonthHasNoMembersError,
+  MonthMembershipConflictError,
   MonthNotFoundError,
   MonthNotPublishableError,
   MemberNotInMonthError,
@@ -12,7 +16,8 @@ import {
   calculateMonthAmount,
   createDraftMonth,
   publishMonthAmount,
-  excludeMemberFromMonth
+  excludeMemberFromMonth,
+  includeMemberInMonth,
 } from './services/months'
 
 interface Env {
@@ -217,7 +222,10 @@ export default {
       /^\/api\/months\/(\d+)\/members\/(\d+)$/,
     )
 
-    if (monthMemberMatch && request.method === 'DELETE') {
+    if (
+      monthMemberMatch &&
+      (request.method === 'DELETE' || request.method === 'POST')
+    ) {
       const monthId = parsePositiveId(monthMemberMatch[1])
       const memberId = parsePositiveId(monthMemberMatch[2])
 
@@ -229,34 +237,36 @@ export default {
       }
 
       try {
-        await excludeMemberFromMonth(
-          env.DB,
-          monthId,
-          memberId,
-        )
+        if (request.method === 'POST') {
+          await includeMemberInMonth(env.DB, monthId, memberId)
+        } else {
+          await excludeMemberFromMonth(env.DB, monthId, memberId)
+        }
 
         return new Response(null, {
           status: 204,
         })
       } catch (error) {
-        if (error instanceof MonthNotFoundError) {
+        if (
+          error instanceof MonthNotFoundError ||
+          error instanceof MemberNotInMonthError ||
+          error instanceof MemberNotFoundError
+        ) {
           return Response.json(
-            { error: 'month not found' },
+            { error: error.message },
             { status: 404 },
           )
         }
 
-        if (error instanceof MonthNotEditableError) {
+        if (
+          error instanceof MonthNotEditableError ||
+          error instanceof MemberNotActiveError ||
+          error instanceof MemberAlreadyInMonthError ||
+          error instanceof MonthMembershipConflictError
+        ) {
           return Response.json(
-            { error: 'month is not editable' },
+            { error: error.message },
             { status: 409 },
-          )
-        }
-
-        if (error instanceof MemberNotInMonthError) {
-          return Response.json(
-            { error: 'member is not included in month' },
-            { status: 404 },
           )
         }
 
