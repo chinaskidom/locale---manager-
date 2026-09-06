@@ -24,3 +24,14 @@ export interface Month {
   published_at: string | null
   closed_at: string | null
 }
+
+export type PaymentStatus = 'UNPAID' | 'PAID'
+
+export interface MonthMember {
+  id: number
+  month_id: number
+  member_id: number
+  created_at: string
+  payment_status: PaymentStatus
+  paid_at: string | null
+}

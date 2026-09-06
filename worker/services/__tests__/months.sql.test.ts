@@ -14,7 +14,7 @@ import {
 } from '../../errors/months'
 import worker from '../../index'
 import * as monthsRepository from '../../repositories/months'
-import type { Month } from '../../types'
+import type { Month, MonthMember } from '../../types'
 import { calculatePerMemberAmount, createDraftMonth, excludeMemberFromMonth, includeMemberInMonth, publishMonthAmount } from '../months'
 
 describe('months (local D1)', () => {
@@ -64,6 +64,109 @@ describe('months (local D1)', () => {
   async function storedMonth(monthId: number) {
     return db.prepare('SELECT * FROM months WHERE id = ?').bind(monthId).first<Month>()
   }
+
+  it('backfills existing participants without changing membership or month amounts', async () => {
+    const legacy = await getPlatformProxy<{ DB: D1Database }>({
+      configPath: fileURLToPath(new URL('../../../wrangler.jsonc', import.meta.url)),
+      persist: false,
+      remoteBindings: false,
+    })
+
+    try {
+      const legacyDb = legacy.env.DB
+      const migrations = new URL('../../../migrations/', import.meta.url)
+      const paymentMigration = '0005_add_month_member_payments.sql'
+      for (const filename of readdirSync(migrations).filter((name) => name.endsWith('.sql') && name < paymentMigration).sort()) {
+        const sql = readFileSync(new URL(filename, migrations), 'utf8')
+        await legacyDb.batch(unstable_splitSqlQuery(sql).map((statement) => legacyDb.prepare(statement)))
+      }
+
+      await legacyDb.prepare(`
+        INSERT INTO members (id, name, email)
+        VALUES (1, 'Member 1', 'member1@example.com'), (2, 'Member 2', 'member2@example.com')
+      `).run()
+      for (const monthNumber of [9, 10, 11]) {
+        const month = await createDraftMonth(legacyDb, { year: 2026, month: monthNumber, billAmountEuros: 32 })
+        if (monthNumber === 9) {
+          await excludeMemberFromMonth(legacyDb, month.id, 2)
+        } else {
+          await publishMonthAmount(legacyDb, month.id)
+          if (monthNumber === 11) {
+            await legacyDb.prepare("UPDATE months SET status = 'CLOSED' WHERE id = ?").bind(month.id).run()
+          }
+        }
+      }
+      await legacyDb.prepare('UPDATE members SET is_active = 0 WHERE id = 2').run()
+      await legacyDb.prepare("INSERT INTO members (name, email) VALUES ('Later member', 'later@example.com')").run()
+      const beforeMembers = (await legacyDb.prepare('SELECT * FROM month_members ORDER BY id').all()).results
+      const beforeMonths = (await legacyDb.prepare('SELECT * FROM months ORDER BY id').all<Month>()).results
+
+      const sql = readFileSync(new URL(paymentMigration, migrations), 'utf8')
+      await legacyDb.batch(unstable_splitSqlQuery(sql).map((statement) => legacyDb.prepare(statement)))
+
+      expect(beforeMembers).toHaveLength(5)
+      expect((await legacyDb.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results).toEqual(
+        beforeMembers.map((member) => ({ ...member, payment_status: 'UNPAID', paid_at: null })),
+      )
+      expect((await legacyDb.prepare('SELECT * FROM months ORDER BY id').all<Month>()).results).toEqual(beforeMonths)
+    } finally {
+      await legacy.dispose()
+    }
+  }, 30_000)
+
+  it('defaults trigger-created participants to UNPAID with no paid timestamp', async () => {
+    const month = await seedMonth(2)
+    const participants = await db.prepare('SELECT * FROM month_members WHERE month_id = ?')
+      .bind(month.id).all<MonthMember>()
+
+    expect(participants.results).toHaveLength(2)
+    for (const participant of participants.results) {
+      expect(participant).toMatchObject({ payment_status: 'UNPAID', paid_at: null })
+    }
+  })
+
+  it.each(['PARTIAL', 'paid', '', null])('rejects invalid payment status %j on insert and update', async (status) => {
+    const month = await seedMonth(1)
+    const query = db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id)
+    const before = await query.first<MonthMember>()
+    const paidAt = '2026-09-21 12:34:56'
+
+    await expect(db.prepare('UPDATE month_members SET payment_status = ?, paid_at = ? WHERE month_id = ?')
+      .bind(status, paidAt, month.id).run()).rejects.toThrow(/constraint failed/)
+    expect(await query.first<MonthMember>()).toEqual(before)
+
+    await excludeMemberFromMonth(db, month.id, 1)
+    await expect(db.prepare('INSERT INTO month_members (month_id, member_id, payment_status, paid_at) VALUES (?, 1, ?, ?)')
+      .bind(month.id, status, paidAt).run()).rejects.toThrow(/constraint failed/)
+    expect(await query.first<MonthMember>()).toBeNull()
+  })
+
+  it('requires a timestamp for PAID and preserves frozen amounts and membership', async () => {
+    const month = await seedMonth(2)
+    await publishMonthAmount(db, month.id)
+    const beforeMonth = await storedMonth(month.id)
+    const query = db.prepare('SELECT * FROM month_members WHERE month_id = ? ORDER BY member_id').bind(month.id)
+    const beforeMembers = (await query.all<MonthMember>()).results
+    const paidAt = '2026-09-21 12:34:56'
+
+    await expect(db.prepare("UPDATE month_members SET payment_status = 'PAID' WHERE month_id = ? AND member_id = 1")
+      .bind(month.id).run()).rejects.toThrow(/constraint failed/)
+    await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = ? WHERE month_id = ? AND member_id = 1")
+      .bind(paidAt, month.id).run()
+
+    expect((await query.all<MonthMember>()).results).toEqual([
+      { ...beforeMembers[0], payment_status: 'PAID', paid_at: paidAt },
+      beforeMembers[1],
+    ])
+    expect(await storedMonth(month.id)).toEqual(beforeMonth)
+    await expect(db.prepare('UPDATE month_members SET paid_at = NULL WHERE month_id = ? AND member_id = 1')
+      .bind(month.id).run()).rejects.toThrow(/constraint failed/)
+
+    await db.prepare("UPDATE month_members SET payment_status = 'UNPAID', paid_at = NULL WHERE month_id = ? AND member_id = 1")
+      .bind(month.id).run()
+    expect((await query.all<MonthMember>()).results).toEqual(beforeMembers)
+    expect(await storedMonth(month.id)).toEqual(beforeMonth)
+  })
 
   it('uses the updated count when an exclusion commits after the publication precheck', async () => {
     const month = await seedMonth(4)
@@ -195,9 +298,12 @@ describe('months (local D1)', () => {
     await expect(includeMemberInMonth(db, month.id, 2)).resolves.toBeUndefined()
     expect(await monthsRepository.isMemberInMonth(db, month.id, 2)).toBe(true)
     expect(await monthsRepository.isMemberInMonth(db, otherMonth.id, 2)).toBe(false)
+    const participant = db.prepare('SELECT * FROM month_members WHERE month_id = ? AND member_id = 2').bind(month.id)
+    expect(await participant.first<MonthMember>()).toMatchObject({ payment_status: 'UNPAID', paid_at: null })
 
     await excludeMemberFromMonth(db, month.id, 2)
     await expect(includeMemberInMonth(db, month.id, 2)).resolves.toBeUndefined()
+    expect(await participant.first<MonthMember>()).toMatchObject({ payment_status: 'UNPAID', paid_at: null })
     expect(await monthsRepository.getMonthCalculationData(db, month.id)).toMatchObject({ member_count: 2 })
     expect(await storedMonth(month.id)).toEqual(month)
   })
