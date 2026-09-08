@@ -13,8 +13,10 @@ import {
   MonthNotPublishableError,
 } from '../../errors/months'
 import worker from '../../index'
+import * as membersRepository from '../../repositories/members'
 import * as monthsRepository from '../../repositories/months'
-import type { Month, MonthMember } from '../../types'
+import type { Member, Month, MonthMember } from '../../types'
+import { setMemberActiveStatus } from '../members'
 import { calculatePerMemberAmount, createDraftMonth, excludeMemberFromMonth, includeMemberInMonth, publishMonthAmount, updateMonthBill } from '../months'
 
 describe('months (local D1)', () => {
@@ -64,6 +66,162 @@ describe('months (local D1)', () => {
   async function storedMonth(monthId: number) {
     return db.prepare('SELECT * FROM months WHERE id = ?').bind(monthId).first<Month>()
   }
+
+  describe('global member activation', () => {
+    function setActive(memberId: number | string, body: unknown) {
+      return worker.fetch(new Request(
+        `https://example.com/api/admin/members/${memberId}/active`,
+        { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+      ), { DB: db })
+    }
+
+    it('persists only the requested member state, preserving all snapshots, payments, and month fields on changes and retries', async () => {
+      const draft = await seedMonth(3)
+      await excludeMemberFromMonth(db, draft.id, 3)
+      for (const monthNumber of [10, 11]) {
+        const month = await createDraftMonth(db, { year: 2026, month: monthNumber, billAmountEuros: 0 })
+        await publishMonthAmount(db, month.id)
+        // Distinct stored values expose accidental quota recalculation or timestamp replacement.
+        await db.prepare(`
+          UPDATE months SET status = ?, per_member_amount_cents = 4321,
+            published_at = '2000-01-01 12:00:00', closed_at = ? WHERE id = ?
+        `).bind(monthNumber === 10 ? 'PUBLISHED' : 'CLOSED', monthNumber === 10 ? null : '2000-02-01 12:00:00', month.id).run()
+        await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = '2000-01-21 12:00:00' WHERE month_id = ? AND member_id = 1")
+          .bind(month.id).run()
+      }
+      const members = db.prepare('SELECT * FROM members ORDER BY id')
+      const months = db.prepare('SELECT * FROM months ORDER BY id')
+      const participants = db.prepare('SELECT * FROM month_members ORDER BY id')
+      const beforeMembers = (await members.all<Member>()).results
+      const beforeMonths = (await months.all<Month>()).results
+      const beforeParticipants = (await participants.all<MonthMember>()).results
+
+      for (const isActive of [true, false, false, true, true]) {
+        const response = await setActive(1, { isActive })
+
+        expect(response.status).toBe(204)
+        expect(await response.text()).toBe('')
+        const expectedMembers = beforeMembers.map((member) =>
+          member.id === 1 ? { ...member, is_active: isActive ? 1 : 0 } : member,
+        )
+        expect((await members.all<Member>()).results).toEqual(expectedMembers)
+        expect((await months.all<Month>()).results).toEqual(beforeMonths)
+        expect((await participants.all<MonthMember>()).results).toEqual(beforeParticipants)
+
+        const listing = await worker.fetch(new Request('https://example.com/api/members'), { DB: db })
+        expect(listing.status).toBe(200)
+        expect(await listing.json()).toEqual(expectedMembers)
+      }
+    })
+
+    it.each([true, false])('accepts concurrent requests for the same desired state %s', async (isActive) => {
+      await seedMonth(1)
+      await setMemberActiveStatus(db, 1, !isActive)
+
+      const responses = await Promise.all([setActive(1, { isActive }), setActive(1, { isActive })])
+
+      expect(responses.map((response) => response.status)).toEqual([204, 204])
+      expect(await membersRepository.getMemberActiveStatus(db, 1)).toBe(isActive ? 1 : 0)
+    })
+
+    it('snapshots only currently active members in new months and never backfills older drafts on reactivation', async () => {
+      const original = await seedMonth(2)
+      await excludeMemberFromMonth(db, original.id, 1)
+      const participants = db.prepare('SELECT * FROM month_members ORDER BY id')
+      let before = (await participants.all<MonthMember>()).results
+
+      for (const [monthNumber, isActive, memberIds] of [[10, false, [2]], [11, true, [1, 2]]] as const) {
+        expect((await setActive(1, { isActive })).status).toBe(204)
+        expect((await participants.all<MonthMember>()).results).toEqual(before)
+        const response = await worker.fetch(new Request('https://example.com/api/months', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ year: 2026, month: monthNumber, billAmountEuros: 0 }),
+        }), { DB: db })
+
+        expect(response.status).toBe(201)
+        const month = await response.json() as Month
+        const after = (await participants.all<MonthMember>()).results
+        expect(after.filter((participant) => participant.month_id !== month.id)).toEqual(before)
+        expect(after.filter((participant) => participant.month_id === month.id).map((participant) => ({
+          member_id: participant.member_id, payment_status: participant.payment_status, paid_at: participant.paid_at,
+        }))).toEqual(memberIds.map((member_id) => ({ member_id, payment_status: 'UNPAID', paid_at: null })))
+        before = after
+      }
+      expect(await monthsRepository.isMemberInMonth(db, original.id, 1)).toBe(false)
+    })
+
+    it.each([true, false])('returns HTTP 404 for a missing member with desired state %s without inserting or changing data', async (isActive) => {
+      const month = await seedMonth(1)
+      const members = (await db.prepare('SELECT * FROM members').all<Member>()).results
+      const participants = (await db.prepare('SELECT * FROM month_members').all<MonthMember>()).results
+
+      const response = await setActive(999, { isActive })
+
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({ error: 'member not found' })
+      expect((await db.prepare('SELECT * FROM members').all<Member>()).results).toEqual(members)
+      expect((await db.prepare('SELECT * FROM month_members').all<MonthMember>()).results).toEqual(participants)
+      expect(await storedMonth(month.id)).toEqual(month)
+    })
+
+    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid member ID %s before querying D1', async (id) => {
+      const prepare = vi.spyOn(db, 'prepare')
+
+      const response = await setActive(id, { isActive: false })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid member id' })
+      expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      { isActive: 0 }, { isActive: 1 }, { isActive: 'true' }, { isActive: 'false' },
+      { isActive: null }, { isActive: [] }, { isActive: {} },
+      {}, null, [], [false], true, false, 0, 'false',
+      { is_active: false }, { isActive: false, name: 'Changed' },
+    ])('rejects invalid or additional activation input %j before querying D1', async (body) => {
+      const prepare = vi.spyOn(db, 'prepare')
+
+      const response = await setActive(1, body)
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'expected only isActive as a boolean' })
+      expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it.each(['{', ''])('rejects malformed or empty JSON %j before querying D1', async (body) => {
+      const prepare = vi.spyOn(db, 'prepare')
+      const response = await worker.fetch(new Request(
+        'https://example.com/api/admin/members/1/active', { method: 'PATCH', body },
+      ), { DB: db })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid JSON body' })
+      expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it('does not expose activation through other HTTP methods', async () => {
+      const prepare = vi.spyOn(db, 'prepare')
+      for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
+        const response = await worker.fetch(new Request(
+          'https://example.com/api/admin/members/1/active', { method },
+        ), { DB: db })
+        expect(response.status).toBe(404)
+      }
+      expect(prepare).not.toHaveBeenCalled()
+    })
+
+    it('propagates D1 failures over HTTP instead of returning success or 404', async () => {
+      const failingDb = {
+        prepare: () => db.prepare('UPDATE missing_members_table SET is_active = ? WHERE id = ?'),
+      } as unknown as D1Database
+
+      await expect(worker.fetch(new Request('https://example.com/api/admin/members/1/active', {
+        method: 'PATCH', body: '{"isActive":false}',
+      }), { DB: failingDb })).rejects.toThrow('no such table: missing_members_table')
+    })
+  })
 
   it('returns HTTP 200 with an empty month list', async () => {
     const response = await worker.fetch(new Request('https://example.com/api/months'), { DB: db })
@@ -756,7 +914,7 @@ describe('months (local D1)', () => {
 
   it('uses only the target month membership, not current active members', async () => {
     const month = await seedMonth(3)
-    await db.prepare('UPDATE members SET is_active = 0 WHERE id = 3').run()
+    await setMemberActiveStatus(db, 3, false)
     await db.prepare(`
       INSERT INTO members (name, email)
       VALUES ('Later member', 'later@example.com'), ('Another member', 'another@example.com')
@@ -831,14 +989,19 @@ describe('months (local D1)', () => {
   it('requires current global activation even for a previously included member', async () => {
     const month = await seedMonth(1)
     await excludeMemberFromMonth(db, month.id, 1)
-    await db.prepare('UPDATE members SET is_active = 0 WHERE id = 1').run()
+    await setMemberActiveStatus(db, 1, false)
+    const url = `https://example.com/api/months/${month.id}/members/1`
 
     await expect(monthsRepository.addMemberToDraftMonth(db, month.id, 1)).resolves.toBe(false)
     await expect(includeMemberInMonth(db, month.id, 1)).rejects.toBeInstanceOf(MemberNotActiveError)
+    const rejected = await worker.fetch(new Request(url, { method: 'POST' }), { DB: db })
+    expect(rejected.status).toBe(409)
+    expect(await rejected.json()).toEqual({ error: 'member is not active' })
     expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(false)
 
-    await db.prepare('UPDATE members SET is_active = 1 WHERE id = 1').run()
-    await expect(includeMemberInMonth(db, month.id, 1)).resolves.toBeUndefined()
+    await setMemberActiveStatus(db, 1, true)
+    expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(false)
+    expect((await worker.fetch(new Request(url, { method: 'POST' }), { DB: db })).status).toBe(204)
     expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(true)
   })
 
@@ -863,7 +1026,7 @@ describe('months (local D1)', () => {
     const add = monthsRepository.addMemberToDraftMonth
 
     vi.spyOn(monthsRepository, 'addMemberToDraftMonth').mockImplementationOnce(async (...args) => {
-      await db.prepare('UPDATE members SET is_active = 0 WHERE id = 1').run()
+      await setMemberActiveStatus(db, 1, false)
       return add(...args)
     })
 

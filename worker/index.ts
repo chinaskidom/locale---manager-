@@ -12,6 +12,7 @@ import {
   MonthNotEditableError
 } from './errors/months'
 import { getAllMembers } from './repositories/members'
+import { setMemberActiveStatus } from './services/members'
 import {
   calculateMonthAmount,
   createDraftMonth,
@@ -53,6 +54,42 @@ export default {
       const members = await getAllMembers(env.DB)
 
       return Response.json(members)
+    }
+
+    const memberActiveMatch = url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/active$/)
+
+    if (memberActiveMatch && request.method === 'PATCH') {
+      const memberId = /^\d+$/.test(memberActiveMatch[1]) ? parsePositiveId(memberActiveMatch[1]) : null
+
+      if (memberId === null) {
+        return Response.json({ error: 'invalid member id' }, { status: 400 })
+      }
+
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return Response.json({ error: 'invalid JSON body' }, { status: 400 })
+      }
+
+      if (
+        typeof body !== 'object' || body === null ||
+        !('isActive' in body) || typeof body.isActive !== 'boolean' ||
+        Object.keys(body).length !== 1
+      ) {
+        return Response.json({ error: 'expected only isActive as a boolean' }, { status: 400 })
+      }
+
+      try {
+        await setMemberActiveStatus(env.DB, memberId, body.isActive)
+        return new Response(null, { status: 204 })
+      } catch (error) {
+        if (error instanceof MemberNotFoundError) {
+          return Response.json({ error: error.message }, { status: 404 })
+        }
+
+        throw error
+      }
     }
 
     if (

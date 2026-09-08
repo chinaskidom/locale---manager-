@@ -1,5 +1,22 @@
 import type { Member } from '../types'
 
+export async function updateMemberActiveStatus(
+  db: D1Database,
+  memberId: number,
+  isActive: boolean,
+): Promise<boolean> {
+  const result = await db
+    .prepare(`
+      UPDATE members
+      SET is_active = ?
+      WHERE id = ?
+    `)
+    .bind(isActive ? 1 : 0, memberId)
+    .run()
+
+  return result.meta.changes === 1
+}
+
 export async function getMemberActiveStatus(
   db: D1Database,
   memberId: number,
