@@ -306,6 +306,186 @@ describe('months (local D1)', () => {
     expect(await storedMonth(month.id)).toEqual(beforeMonth)
   })
 
+  describe('manual payment marking', () => {
+    function markPaid(monthId: number, memberId = 1) {
+      return worker.fetch(new Request(
+        `https://example.com/api/admin/months/${monthId}/members/${memberId}/paid`,
+        { method: 'POST' },
+      ), { DB: db })
+    }
+
+    it('persists PAID and the database timestamp without changing membership, quotas, or other participants', async () => {
+      const month = await seedMonth(2)
+      await createDraftMonth(db, { year: 2026, month: 10, billAmountEuros: 0 })
+      await publishMonthAmount(db, month.id)
+      // A distinct stored quota detects recalculation; global inactivity must not block payment.
+      await db.prepare('UPDATE months SET per_member_amount_cents = 4321 WHERE id = ?').bind(month.id).run()
+      await db.prepare('UPDATE members SET is_active = 0 WHERE id = 1').run()
+      const months = db.prepare('SELECT * FROM months ORDER BY id')
+      const participants = db.prepare('SELECT * FROM month_members ORDER BY id')
+      const beforeMonths = (await months.all<Month>()).results
+      const beforeMembers = (await participants.all<MonthMember>()).results
+      const start = await db.prepare('SELECT unixepoch() AS now').first<number>('now')
+
+      const response = await markPaid(month.id)
+
+      expect(response.status).toBe(204)
+      expect(await response.text()).toBe('')
+      const end = await db.prepare('SELECT unixepoch() AS now').first<number>('now')
+      const afterMembers = (await participants.all<MonthMember>()).results
+      const paidAt = afterMembers[0].paid_at!
+      expect(paidAt).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+      const paidSeconds = Date.parse(paidAt.replace(' ', 'T') + 'Z') / 1000
+      expect(paidSeconds).toBeGreaterThanOrEqual(start!)
+      expect(paidSeconds).toBeLessThanOrEqual(end!)
+      expect(afterMembers).toEqual(beforeMembers.map((member) =>
+        member.month_id === month.id && member.member_id === 1
+          ? { ...member, payment_status: 'PAID', paid_at: paidAt }
+          : member,
+      ))
+      expect((await months.all<Month>()).results).toEqual(beforeMonths)
+
+      const detail = await worker.fetch(new Request(`https://example.com/api/months/${month.id}`), { DB: db })
+      expect(await detail.json()).toMatchObject({
+        participants: [
+          { member_id: 1, payment_status: 'PAID', paid_at: paidAt },
+          { member_id: 2, payment_status: 'UNPAID', paid_at: null },
+        ],
+      })
+      expect((await markPaid(month.id)).status).toBe(204)
+      expect((await participants.all<MonthMember>()).results).toEqual(afterMembers)
+      expect((await months.all<Month>()).results).toEqual(beforeMonths)
+    })
+
+    it('preserves an older PAID timestamp on repeated requests, including concurrent retries', async () => {
+      const month = await seedMonth(1)
+      await publishMonthAmount(db, month.id)
+      // An older timestamp catches replacement even when retries run in the same second.
+      await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = '2000-01-01 12:00:00' WHERE month_id = ?")
+        .bind(month.id).run()
+      const query = db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id)
+      const before = (await query.all<MonthMember>()).results
+
+      const responses = await Promise.all([markPaid(month.id), markPaid(month.id)])
+
+      expect(responses.map((response) => response.status)).toEqual([204, 204])
+      expect((await query.all<MonthMember>()).results).toEqual(before)
+    })
+
+    it('allows concurrent attempts to mark an UNPAID participant successfully', async () => {
+      const month = await seedMonth(1)
+      await publishMonthAmount(db, month.id)
+
+      const responses = await Promise.all([markPaid(month.id), markPaid(month.id)])
+
+      expect(responses.map((response) => response.status)).toEqual([204, 204])
+      expect(await db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id).first<MonthMember>())
+        .toMatchObject({ payment_status: 'PAID', paid_at: expect.any(String) })
+    })
+
+    it.each([
+      { status: 'DRAFT', payment_status: 'UNPAID' },
+      { status: 'DRAFT', payment_status: 'PAID' },
+      { status: 'CLOSED', payment_status: 'UNPAID' },
+      { status: 'CLOSED', payment_status: 'PAID' },
+    ] as const)('guards $status / $payment_status in SQL and returns HTTP 409', async ({ status, payment_status }) => {
+      const month = await seedMonth(1)
+      await db.prepare('UPDATE months SET status = ? WHERE id = ?').bind(status, month.id).run()
+      if (payment_status === 'PAID') {
+        await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = '2000-01-01 12:00:00' WHERE month_id = ?")
+          .bind(month.id).run()
+      }
+      const query = db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id)
+      const beforeMembers = (await query.all<MonthMember>()).results
+      const beforeMonth = await storedMonth(month.id)
+
+      await expect(monthsRepository.markMemberPaid(db, month.id, 1)).resolves.toEqual({ status, payment_status })
+      expect((await query.all<MonthMember>()).results).toEqual(beforeMembers)
+      const response = await markPaid(month.id)
+
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({ error: 'month is not editable' })
+      expect((await query.all<MonthMember>()).results).toEqual(beforeMembers)
+      expect(await storedMonth(month.id)).toEqual(beforeMonth)
+    })
+
+    it.each(['missing month', 'excluded participant', 'unknown member'])('returns HTTP 404 for $0 without changing data', async (state) => {
+      const month = await seedMonth(2)
+      await excludeMemberFromMonth(db, month.id, 2)
+      await publishMonthAmount(db, month.id)
+      const query = db.prepare('SELECT * FROM month_members ORDER BY id')
+      const beforeMembers = (await query.all<MonthMember>()).results
+      const beforeMonth = await storedMonth(month.id)
+
+      const response = await markPaid(
+        state === 'missing month' ? month.id + 1 : month.id,
+        state === 'unknown member' ? 999 : 2,
+      )
+
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({
+        error: state === 'missing month' ? 'month not found' : 'member is not included in month',
+      })
+      expect((await query.all<MonthMember>()).results).toEqual(beforeMembers)
+      expect(await storedMonth(month.id)).toEqual(beforeMonth)
+    })
+
+    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid month/member ID %s before querying D1', async (id) => {
+      const mark = vi.spyOn(monthsRepository, 'markMemberPaid')
+      for (const path of [`${id}/members/1`, `1/members/${id}`]) {
+        const response = await worker.fetch(new Request(
+          `https://example.com/api/admin/months/${path}/paid`, { method: 'POST' },
+        ), { DB: db })
+        expect(response.status).toBe(400)
+        expect(await response.json()).toEqual({ error: 'invalid id' })
+      }
+      expect(mark).not.toHaveBeenCalled()
+    })
+
+    it('accepts a zero-byte POST body stream as an empty request', async () => {
+      const month = await seedMonth(1)
+      await publishMonthAmount(db, month.id)
+      const request = new Request(
+        `https://example.com/api/admin/months/${month.id}/members/1/paid`,
+        { method: 'POST', headers: { 'Content-Length': '0' }, body: '' },
+      )
+      expect(request.body).not.toBeNull()
+
+      const response = await worker.fetch(request, { DB: db })
+
+      expect(response.status).toBe(204)
+      expect(await db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id).first<MonthMember>())
+        .toMatchObject({ payment_status: 'PAID', paid_at: expect.any(String) })
+    })
+
+    it.each(['{"paid_at":"2000-01-01 12:00:00"}', '{"payment_status":"UNPAID"}', '{'])('rejects request body %s without writing', async (body) => {
+      const month = await seedMonth(1)
+      await publishMonthAmount(db, month.id)
+      const mark = vi.spyOn(monthsRepository, 'markMemberPaid')
+      const response = await worker.fetch(new Request(
+        `https://example.com/api/admin/months/${month.id}/members/1/paid`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+      ), { DB: db })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'request body is not allowed' })
+      expect(mark).not.toHaveBeenCalled()
+      expect(await db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id).first<MonthMember>())
+        .toMatchObject({ payment_status: 'UNPAID', paid_at: null })
+    })
+
+    it('does not expose payment marking or reversal through other HTTP methods', async () => {
+      const mark = vi.spyOn(monthsRepository, 'markMemberPaid')
+      for (const method of ['GET', 'PATCH', 'DELETE']) {
+        const response = await worker.fetch(new Request(
+          'https://example.com/api/admin/months/1/members/1/paid', { method },
+        ), { DB: db })
+        expect(response.status).toBe(404)
+      }
+      expect(mark).not.toHaveBeenCalled()
+    })
+  })
+
   it('uses the updated count when an exclusion commits after the publication precheck', async () => {
     const month = await seedMonth(4)
     const publish = monthsRepository.publishMonth

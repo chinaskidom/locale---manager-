@@ -17,6 +17,7 @@ import {
   excludeMemberFromMonth,
   getMonthDetail,
   includeMemberInMonth,
+  markMemberPaymentPaid,
 } from '../months'
 import * as membersRepository from '../../repositories/members'
 import * as monthsRepository from '../../repositories/months'
@@ -259,6 +260,43 @@ describe('publishMonthAmount', () => {
     )
 
     expect(publishSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('markMemberPaymentPaid', () => {
+  const db = {} as D1Database
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.spyOn(monthsRepository, 'markMemberPaid').mockResolvedValue({
+      status: 'PUBLISHED', payment_status: 'PAID',
+    })
+  })
+
+  it('accepts a successful transition and repeated marking', async () => {
+    await expect(markMemberPaymentPaid(db, 2, 4)).resolves.toBeUndefined()
+    await expect(markMemberPaymentPaid(db, 2, 4)).resolves.toBeUndefined()
+    expect(monthsRepository.markMemberPaid).toHaveBeenCalledWith(db, 2, 4)
+    expect(monthsRepository.markMemberPaid).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    { result: null, error: MonthNotFoundError },
+    { result: { status: 'DRAFT', payment_status: 'UNPAID' }, error: MonthNotEditableError },
+    { result: { status: 'CLOSED', payment_status: 'PAID' }, error: MonthNotEditableError },
+    { result: { status: 'PUBLISHED', payment_status: null }, error: MemberNotInMonthError },
+  ] as const)('maps the transactional result $result to $error.name', async ({ result, error }) => {
+    vi.mocked(monthsRepository.markMemberPaid).mockResolvedValue(result)
+
+    await expect(markMemberPaymentPaid(db, 2, 4)).rejects.toBeInstanceOf(error)
+    expect(monthsRepository.markMemberPaid).toHaveBeenCalledExactlyOnceWith(db, 2, 4)
+  })
+
+  it('propagates database failures instead of returning success or a domain error', async () => {
+    const error = new Error('database unavailable')
+    vi.mocked(monthsRepository.markMemberPaid).mockRejectedValue(error)
+
+    await expect(markMemberPaymentPaid(db, 2, 4)).rejects.toBe(error)
   })
 })
 

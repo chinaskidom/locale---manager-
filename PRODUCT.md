@@ -39,6 +39,10 @@ The exact rule allowing a PUBLISHED month to become CLOSED is undecided and must
 - When a payment becomes PAID, store when it was paid.
 - Unpaid status must not alter membership or the frozen monthly quota.
 - The administrator must be able to mark payments manually, including cash payments. Giovanni commonly pays cash, but this is not a special domain rule.
+- Manual marking is the administrator's explicit confirmation that payment was received, whether in cash or by another personally verified method. No external transaction is required.
+- Manual marking allows only UNPAID -> PAID in PUBLISHED months. DRAFT payments cannot be recorded, and CLOSED months are not editable.
+- The server/database generates `paid_at` when the transition succeeds. Repeating the operation for an already-PAID participant in a PUBLISHED month succeeds without changing the original timestamp.
+- Manual marking must not change participation, the stored official quota, or any other participant. Reversal, backdating, timestamp editing, and CLOSED-month corrections are outside this operation's scope; client-supplied timestamps are not accepted.
 - Verified automatic reconciliation may eventually update payment status. A possible match alone must never mark a payment PAID; false negatives are preferable to false positives.
 
 ## Member Experience

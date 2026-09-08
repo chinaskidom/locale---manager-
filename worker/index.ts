@@ -20,6 +20,7 @@ import {
   excludeMemberFromMonth,
   includeMemberInMonth,
   listMonths,
+  markMemberPaymentPaid,
 } from './services/months'
 
 interface Env {
@@ -249,6 +250,39 @@ export default {
             { error: 'month already exists' },
             { status: 409 },
           )
+        }
+
+        throw error
+      }
+    }
+
+    const paymentMatch = url.pathname.match(
+      /^\/api\/admin\/months\/([^/]+)\/members\/([^/]+)\/paid$/,
+    )
+
+    if (paymentMatch && request.method === 'POST') {
+      // Manual administrator confirmation; protect this route when authorization is added.
+      const monthId = /^\d+$/.test(paymentMatch[1]) ? parsePositiveId(paymentMatch[1]) : null
+      const memberId = /^\d+$/.test(paymentMatch[2]) ? parsePositiveId(paymentMatch[2]) : null
+
+      if (monthId === null || memberId === null) {
+        return Response.json({ error: 'invalid id' }, { status: 400 })
+      }
+
+      if (await request.text()) {
+        return Response.json({ error: 'request body is not allowed' }, { status: 400 })
+      }
+
+      try {
+        await markMemberPaymentPaid(env.DB, monthId, memberId)
+        return new Response(null, { status: 204 })
+      } catch (error) {
+        if (error instanceof MonthNotFoundError || error instanceof MemberNotInMonthError) {
+          return Response.json({ error: error.message }, { status: 404 })
+        }
+
+        if (error instanceof MonthNotEditableError) {
+          return Response.json({ error: error.message }, { status: 409 })
         }
 
         throw error

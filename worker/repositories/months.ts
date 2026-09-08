@@ -1,4 +1,4 @@
-import type { Month, MonthDetail, MonthParticipant, MonthStatus } from '../types'
+import type { Month, MonthDetail, MonthParticipant, MonthStatus, PaymentStatus } from '../types'
 
 export async function getAllMonths(db: D1Database): Promise<Month[]> {
   const result = await db.prepare(`
@@ -124,6 +124,38 @@ export async function publishMonth(
   return result.meta.changes === 1
     ? result.results[0].per_member_amount_cents
     : null
+}
+
+interface MonthPaymentState {
+  status: MonthStatus
+  payment_status: PaymentStatus | null
+}
+
+export async function markMemberPaid(
+  db: D1Database,
+  monthId: number,
+  memberId: number,
+): Promise<MonthPaymentState | null> {
+  // Keep the guarded transition and its outcome read in the same transaction.
+  const [, result] = await db.batch<MonthPaymentState>([
+    db.prepare(`
+      UPDATE month_members
+      SET payment_status = 'PAID', paid_at = CURRENT_TIMESTAMP
+      WHERE month_id = ? AND member_id = ?
+        AND payment_status = 'UNPAID'
+        AND EXISTS (
+          SELECT 1 FROM months WHERE id = ? AND status = 'PUBLISHED'
+        )
+    `).bind(monthId, memberId, monthId),
+    db.prepare(`
+      SELECT m.status, mm.payment_status
+      FROM months m
+      LEFT JOIN month_members mm ON mm.month_id = m.id AND mm.member_id = ?
+      WHERE m.id = ?
+    `).bind(memberId, monthId),
+  ])
+
+  return result.results[0] ?? null
 }
 
 export interface CreateMonthData {

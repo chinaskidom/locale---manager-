@@ -6,6 +6,7 @@ import {
   getMonthDetail as selectMonthDetail,
   getMonthStatus,
   isMemberInMonth,
+  markMemberPaid,
   publishMonth,
   removeMemberFromDraftMonth,
 } from '../repositories/months'
@@ -124,6 +125,26 @@ export async function publishMonthAmount(
   }
 
   return perMemberAmountCents
+}
+
+export async function markMemberPaymentPaid(
+  db: D1Database,
+  monthId: number,
+  memberId: number,
+): Promise<void> {
+  const payment = await markMemberPaid(db, monthId, memberId)
+
+  if (!payment) {
+    throw new MonthNotFoundError()
+  }
+
+  if (payment.status !== 'PUBLISHED') {
+    throw new MonthNotEditableError()
+  }
+
+  if (payment.payment_status === null) {
+    throw new MemberNotInMonthError()
+  }
 }
 
 export interface CreateDraftMonthInput {
