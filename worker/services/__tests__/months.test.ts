@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  InvalidMonthInputError,
   MemberAlreadyInMonthError,
   MemberNotActiveError,
   MemberNotFoundError,
@@ -18,6 +19,7 @@ import {
   getMonthDetail,
   includeMemberInMonth,
   markMemberPaymentPaid,
+  updateMonthBill,
 } from '../months'
 import * as membersRepository from '../../repositories/members'
 import * as monthsRepository from '../../repositories/months'
@@ -406,6 +408,60 @@ describe('createDraftMonth', () => {
     )
 
     expect(createMonthSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('updateMonthBill', () => {
+  const db = {} as D1Database
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.spyOn(monthsRepository, 'updateDraftMonthBill').mockResolvedValue(true)
+    vi.spyOn(monthsRepository, 'getMonthStatus').mockResolvedValue('DRAFT')
+  })
+
+  it.each([
+    { euros: 34, cents: 3400 },
+    { euros: 0, cents: 0 },
+    { euros: 90071992547409, cents: 9007199254740900 },
+  ])('converts $euros whole euros to $cents safe integer cents', async ({ euros, cents }) => {
+    await expect(updateMonthBill(db, 2, euros)).resolves.toBeUndefined()
+    expect(monthsRepository.updateDraftMonthBill).toHaveBeenCalledExactlyOnceWith(db, 2, cents)
+    expect(monthsRepository.getMonthStatus).not.toHaveBeenCalled()
+  })
+
+  it.each([-1, 34.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGER, 90071992547410])(
+    'rejects invalid bill %s before writes in both editing and creation', async (billAmountEuros) => {
+      const create = vi.spyOn(monthsRepository, 'createMonth')
+
+      await expect(updateMonthBill(db, 2, billAmountEuros)).rejects.toBeInstanceOf(InvalidMonthInputError)
+      await expect(createDraftMonth(db, { year: 2026, month: 9, billAmountEuros }))
+        .rejects.toBeInstanceOf(InvalidMonthInputError)
+      expect(monthsRepository.updateDraftMonthBill).not.toHaveBeenCalled()
+      expect(monthsRepository.getMonthStatus).not.toHaveBeenCalled()
+      expect(create).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    { status: null, error: MonthNotFoundError },
+    { status: 'PUBLISHED', error: MonthNotEditableError },
+    { status: 'CLOSED', error: MonthNotEditableError },
+  ] as const)('diagnoses a rejected SQL update for month status $status', async ({ status, error }) => {
+    vi.mocked(monthsRepository.updateDraftMonthBill).mockResolvedValue(false)
+    vi.mocked(monthsRepository.getMonthStatus).mockResolvedValue(status)
+
+    await expect(updateMonthBill(db, 2, 34)).rejects.toBeInstanceOf(error)
+    expect(monthsRepository.updateDraftMonthBill).toHaveBeenCalledExactlyOnceWith(db, 2, 3400)
+    expect(monthsRepository.getMonthStatus).toHaveBeenCalledExactlyOnceWith(db, 2)
+  })
+
+  it('propagates database failures rather than returning success or a domain error', async () => {
+    const error = new Error('database unavailable')
+    vi.mocked(monthsRepository.updateDraftMonthBill).mockRejectedValue(error)
+
+    await expect(updateMonthBill(db, 2, 34)).rejects.toBe(error)
+    expect(monthsRepository.getMonthStatus).not.toHaveBeenCalled()
   })
 })
 

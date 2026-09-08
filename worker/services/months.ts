@@ -9,6 +9,7 @@ import {
   markMemberPaid,
   publishMonth,
   removeMemberFromDraftMonth,
+  updateDraftMonthBill,
 } from '../repositories/months'
 import { getMemberActiveStatus } from '../repositories/members'
 import type { Month, MonthDetail } from '../types'
@@ -153,6 +154,22 @@ export interface CreateDraftMonthInput {
   billAmountEuros: number
 }
 
+function billEurosToCents(billAmountEuros: number): number {
+  if (!Number.isSafeInteger(billAmountEuros) || billAmountEuros < 0) {
+    throw new InvalidMonthInputError(
+      'billAmountEuros must be a non-negative integer',
+    )
+  }
+
+  const billAmountCents = billAmountEuros * 100
+
+  if (!Number.isSafeInteger(billAmountCents)) {
+    throw new InvalidMonthInputError('bill amount is too large')
+  }
+
+  return billAmountCents
+}
+
 export async function createDraftMonth(
   db: D1Database,
   input: CreateDraftMonthInput,
@@ -173,22 +190,7 @@ export async function createDraftMonth(
     )
   }
 
-  if (
-    !Number.isSafeInteger(input.billAmountEuros) ||
-    input.billAmountEuros < 0
-  ) {
-    throw new InvalidMonthInputError(
-      'billAmountEuros must be a non-negative integer',
-    )
-  }
-
-  const billAmountCents = input.billAmountEuros * 100
-
-  if (!Number.isSafeInteger(billAmountCents)) {
-    throw new InvalidMonthInputError(
-      'bill amount is too large',
-    )
-  }
+  const billAmountCents = billEurosToCents(input.billAmountEuros)
 
   const dueDate =
     `${input.year}-${String(input.month).padStart(2, '0')}-21`
@@ -205,6 +207,24 @@ export async function createDraftMonth(
   }
 
   return month
+}
+
+export async function updateMonthBill(
+  db: D1Database,
+  monthId: number,
+  billAmountEuros: number,
+): Promise<void> {
+  const billAmountCents = billEurosToCents(billAmountEuros)
+
+  if (await updateDraftMonthBill(db, monthId, billAmountCents)) {
+    return
+  }
+
+  if (await getMonthStatus(db, monthId) === null) {
+    throw new MonthNotFoundError()
+  }
+
+  throw new MonthNotEditableError()
 }
 
 export async function excludeMemberFromMonth(

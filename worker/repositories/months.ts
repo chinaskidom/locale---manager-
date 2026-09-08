@@ -203,6 +203,20 @@ export async function createMonth(
   return result ?? null
 }
 
+export async function updateDraftMonthBill(
+  db: D1Database,
+  monthId: number,
+  billAmountCents: number,
+): Promise<boolean> {
+  const result = await db.prepare(`
+    UPDATE months
+    SET bill_amount_cents = ?
+    WHERE id = ? AND status = 'DRAFT'
+  `).bind(billAmountCents, monthId).run()
+
+  return result.meta.changes === 1
+}
+
 export async function removeMemberFromDraftMonth(
   db: D1Database,
   monthId: number,

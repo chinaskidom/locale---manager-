@@ -21,6 +21,7 @@ import {
   includeMemberInMonth,
   listMonths,
   markMemberPaymentPaid,
+  updateMonthBill,
 } from './services/months'
 
 interface Env {
@@ -250,6 +251,50 @@ export default {
             { error: 'month already exists' },
             { status: 409 },
           )
+        }
+
+        throw error
+      }
+    }
+
+    const billMatch = url.pathname.match(/^\/api\/admin\/months\/([^/]+)\/bill$/)
+
+    if (billMatch && request.method === 'PATCH') {
+      const monthId = /^\d+$/.test(billMatch[1]) ? parsePositiveId(billMatch[1]) : null
+
+      if (monthId === null) {
+        return Response.json({ error: 'invalid month id' }, { status: 400 })
+      }
+
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return Response.json({ error: 'invalid JSON body' }, { status: 400 })
+      }
+
+      if (
+        typeof body !== 'object' || body === null ||
+        !('billAmountEuros' in body) || typeof body.billAmountEuros !== 'number' ||
+        Object.keys(body).length !== 1
+      ) {
+        return Response.json({ error: 'expected only billAmountEuros as a number' }, { status: 400 })
+      }
+
+      try {
+        await updateMonthBill(env.DB, monthId, body.billAmountEuros)
+        return new Response(null, { status: 204 })
+      } catch (error) {
+        if (error instanceof InvalidMonthInputError) {
+          return Response.json({ error: error.message }, { status: 400 })
+        }
+
+        if (error instanceof MonthNotFoundError) {
+          return Response.json({ error: error.message }, { status: 404 })
+        }
+
+        if (error instanceof MonthNotEditableError) {
+          return Response.json({ error: error.message }, { status: 409 })
         }
 
         throw error

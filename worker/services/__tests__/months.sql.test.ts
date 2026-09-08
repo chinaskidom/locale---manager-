@@ -15,7 +15,7 @@ import {
 import worker from '../../index'
 import * as monthsRepository from '../../repositories/months'
 import type { Month, MonthMember } from '../../types'
-import { calculatePerMemberAmount, createDraftMonth, excludeMemberFromMonth, includeMemberInMonth, publishMonthAmount } from '../months'
+import { calculatePerMemberAmount, createDraftMonth, excludeMemberFromMonth, includeMemberInMonth, publishMonthAmount, updateMonthBill } from '../months'
 
 describe('months (local D1)', () => {
   let platform: PlatformProxy<{ DB: D1Database }>
@@ -304,6 +304,165 @@ describe('months (local D1)', () => {
       .bind(month.id).run()
     expect((await query.all<MonthMember>()).results).toEqual(beforeMembers)
     expect(await storedMonth(month.id)).toEqual(beforeMonth)
+  })
+
+  describe('draft bill editing', () => {
+    function editBill(monthId: number, body: unknown) {
+      return worker.fetch(new Request(
+        `https://example.com/api/admin/months/${monthId}/bill`,
+        { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+      ), { DB: db })
+    }
+
+    it.each([
+      { euros: 34, preview: 5134 },
+      { euros: 0, preview: 4000 },
+      { euros: 32, preview: 5067 },
+    ])('edits a DRAFT to $euros euros without changing other fields and previews $preview cents', async ({ euros, preview }) => {
+      const month = await seedMonth(4)
+      await excludeMemberFromMonth(db, month.id, 4)
+      const otherMonth = await createDraftMonth(db, { year: 2026, month: 10, billAmountEuros: 0 })
+      await db.prepare('UPDATE members SET is_active = 0 WHERE id = 2').run()
+      // A distinct payment fixture detects unintended resets of participation fields.
+      await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = '2000-01-01 12:00:00' WHERE month_id = ? AND member_id = 1")
+        .bind(month.id).run()
+      const participants = db.prepare('SELECT * FROM month_members ORDER BY id')
+      const beforeMembers = (await participants.all<MonthMember>()).results
+
+      const response = await editBill(month.id, { billAmountEuros: euros })
+
+      expect(response.status).toBe(204)
+      expect(await response.text()).toBe('')
+      expect(await storedMonth(month.id)).toEqual({ ...month, bill_amount_cents: euros * 100 })
+      expect(await storedMonth(otherMonth.id)).toEqual(otherMonth)
+      expect((await participants.all<MonthMember>()).results).toEqual(beforeMembers)
+      expect(await db.prepare('SELECT typeof(bill_amount_cents) AS type FROM months WHERE id = ?')
+        .bind(month.id).first('type')).toBe('integer')
+
+      const calculation = await worker.fetch(new Request(
+        `https://example.com/api/months/${month.id}/calculation`,
+      ), { DB: db })
+      expect(calculation.status).toBe(200)
+      expect(await calculation.json()).toEqual({ perMemberAmountCents: preview })
+      expect(await storedMonth(month.id)).toEqual({ ...month, bill_amount_cents: euros * 100 })
+    })
+
+    it('persists the largest whole-euro bill whose cents are a safe integer', async () => {
+      const month = await seedMonth(0)
+
+      expect((await editBill(month.id, { billAmountEuros: 90071992547409 })).status).toBe(204)
+      expect(await storedMonth(month.id)).toEqual({ ...month, bill_amount_cents: 9007199254740900 })
+      expect(await db.prepare('SELECT typeof(bill_amount_cents) AS type FROM months WHERE id = ?')
+        .bind(month.id).first('type')).toBe('integer')
+    })
+
+    it.each([
+      { billAmountEuros: -1 },
+      { billAmountEuros: 34.5 },
+      { billAmountEuros: Number.MAX_SAFE_INTEGER + 1 },
+      { billAmountEuros: Number.MAX_SAFE_INTEGER },
+      { billAmountEuros: 90071992547410 },
+      { billAmountEuros: '34' },
+      { billAmountEuros: null },
+      { billAmountEuros: true },
+      {}, null, [],
+      { billAmountEuros: 34, fixedAmountCents: 0 },
+      { billAmountEuros: 34, per_member_amount_cents: 1 },
+    ])('rejects invalid or additional bill input %j without writing', async (body) => {
+      const month = await seedMonth(0)
+      const update = vi.spyOn(monthsRepository, 'updateDraftMonthBill')
+
+      const response = await editBill(month.id, body)
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toHaveProperty('error')
+      expect(update).not.toHaveBeenCalled()
+      expect(await storedMonth(month.id)).toEqual(month)
+    })
+
+    it('rejects malformed JSON before querying D1', async () => {
+      const update = vi.spyOn(monthsRepository, 'updateDraftMonthBill')
+      const response = await worker.fetch(new Request(
+        'https://example.com/api/admin/months/1/bill', { method: 'PATCH', body: '{' },
+      ), { DB: db })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid JSON body' })
+      expect(update).not.toHaveBeenCalled()
+    })
+
+    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid bill route ID %s before querying D1', async (id) => {
+      const update = vi.spyOn(monthsRepository, 'updateDraftMonthBill')
+      const response = await worker.fetch(new Request(
+        `https://example.com/api/admin/months/${id}/bill`,
+        { method: 'PATCH', body: '{"billAmountEuros":34}' },
+      ), { DB: db })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid month id' })
+      expect(update).not.toHaveBeenCalled()
+    })
+
+    it('returns HTTP 404 for a missing month without creating it or editing another month', async () => {
+      const month = await seedMonth(0)
+
+      const response = await editBill(month.id + 1, { billAmountEuros: 34 })
+
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({ error: 'month not found' })
+      expect(await storedMonth(month.id + 1)).toBeNull()
+      expect(await storedMonth(month.id)).toEqual(month)
+    })
+
+    it.each(['PUBLISHED', 'CLOSED'] as const)('guards %s bills in SQL and returns HTTP 409 without changing the official quota or other data', async (status) => {
+      const month = await seedMonth(2)
+      await publishMonthAmount(db, month.id)
+      await db.prepare('UPDATE months SET status = ? WHERE id = ?').bind(status, month.id).run()
+      const beforeMonth = await storedMonth(month.id)
+      const participants = db.prepare('SELECT * FROM month_members ORDER BY id')
+      const beforeMembers = (await participants.all<MonthMember>()).results
+
+      await expect(monthsRepository.updateDraftMonthBill(db, month.id, 3400)).resolves.toBe(false)
+      expect(await storedMonth(month.id)).toEqual(beforeMonth)
+      const response = await editBill(month.id, { billAmountEuros: 34 })
+
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({ error: 'month is not editable' })
+      expect(await storedMonth(month.id)).toEqual(beforeMonth)
+      expect((await participants.all<MonthMember>()).results).toEqual(beforeMembers)
+    })
+
+    it('rejects an in-flight bill edit when publication wins before the guarded write', async () => {
+      const month = await seedMonth(3)
+      const update = monthsRepository.updateDraftMonthBill
+      let published: Month | null = null
+      vi.spyOn(monthsRepository, 'updateDraftMonthBill').mockImplementationOnce(async (...args) => {
+        await expect(publishMonthAmount(db, month.id)).resolves.toBe(5067)
+        published = await storedMonth(month.id)
+        return update(...args)
+      })
+
+      const response = await editBill(month.id, { billAmountEuros: 100 })
+
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({ error: 'month is not editable' })
+      expect(await storedMonth(month.id)).toEqual(published)
+    })
+
+    it('publishes the new bill if editing wins after the publication precheck', async () => {
+      const month = await seedMonth(3)
+      const publish = monthsRepository.publishMonth
+      vi.spyOn(monthsRepository, 'publishMonth').mockImplementationOnce(async (...args) => {
+        await updateMonthBill(db, month.id, 100)
+        expect(await storedMonth(month.id)).toEqual({ ...month, bill_amount_cents: 10000 })
+        return publish(...args)
+      })
+
+      await expect(publishMonthAmount(db, month.id)).resolves.toBe(7334)
+      expect(await storedMonth(month.id)).toMatchObject({
+        bill_amount_cents: 10000, per_member_amount_cents: 7334, status: 'PUBLISHED',
+      })
+    })
   })
 
   describe('manual payment marking', () => {
