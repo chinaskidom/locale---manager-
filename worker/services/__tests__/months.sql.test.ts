@@ -3,6 +3,7 @@ import { fileURLToPath, URL } from 'node:url'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getPlatformProxy, unstable_splitSqlQuery } from 'wrangler'
 import type { PlatformProxy } from 'wrangler'
+import { authConfig, createAuthFixture } from '../../__tests__/auth-fixture'
 import {
   MemberAlreadyInMonthError,
   MemberNotActiveError,
@@ -22,10 +23,13 @@ import { calculatePerMemberAmount, createDraftMonth, excludeMemberFromMonth, inc
 describe('months (local D1)', () => {
   let platform: PlatformProxy<{ DB: D1Database }>
   let db: D1Database
+  let auth: Awaited<ReturnType<typeof createAuthFixture>>
 
   beforeAll(async () => {
+    auth = await createAuthFixture()
     platform = await getPlatformProxy<{ DB: D1Database }>({
       configPath: fileURLToPath(new URL('../../../wrangler.jsonc', import.meta.url)),
+      envFiles: [fileURLToPath(new URL('../../__tests__/test.env', import.meta.url))],
       persist: false,
       remoteBindings: false,
     })
@@ -46,12 +50,23 @@ describe('months (local D1)', () => {
     await db.batch([
       db.prepare('DELETE FROM months'),
       db.prepare('DELETE FROM members'),
+      // Authentication requires a member row; inactivity keeps domain snapshots unchanged.
+      db.prepare("INSERT INTO members (id, name, email, is_active) VALUES (1000, 'Admin', ?, 0)")
+        .bind(authConfig.ADMIN_EMAIL),
     ])
+    auth.mockJwks()
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
   })
+
+  async function adminFetch(request: Request, env: Pick<Env, 'DB'>) {
+    const headers = new Headers(request.headers)
+    headers.set('Cf-Access-Jwt-Assertion', await auth.sign())
+    headers.set('Origin', authConfig.APP_ORIGIN)
+    return worker.fetch(new Request(request, { headers }), { ...authConfig, ...env })
+  }
 
   async function seedMonth(memberCount: number, billAmountEuros = 32) {
     for (let id = 1; id <= memberCount; id++) {
@@ -69,7 +84,7 @@ describe('months (local D1)', () => {
 
   describe('global member activation', () => {
     function setActive(memberId: number | string, body: unknown) {
-      return worker.fetch(new Request(
+      return adminFetch(new Request(
         `https://example.com/api/admin/members/${memberId}/active`,
         { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
       ), { DB: db })
@@ -89,7 +104,7 @@ describe('months (local D1)', () => {
         await db.prepare("UPDATE month_members SET payment_status = 'PAID', paid_at = '2000-01-21 12:00:00' WHERE month_id = ? AND member_id = 1")
           .bind(month.id).run()
       }
-      const members = db.prepare('SELECT * FROM members ORDER BY id')
+      const members = db.prepare('SELECT * FROM members ORDER BY name')
       const months = db.prepare('SELECT * FROM months ORDER BY id')
       const participants = db.prepare('SELECT * FROM month_members ORDER BY id')
       const beforeMembers = (await members.all<Member>()).results
@@ -108,7 +123,7 @@ describe('months (local D1)', () => {
         expect((await months.all<Month>()).results).toEqual(beforeMonths)
         expect((await participants.all<MonthMember>()).results).toEqual(beforeParticipants)
 
-        const listing = await worker.fetch(new Request('https://example.com/api/members'), { DB: db })
+        const listing = await adminFetch(new Request('https://example.com/api/members'), { DB: db })
         expect(listing.status).toBe(200)
         expect(await listing.json()).toEqual(expectedMembers)
       }
@@ -133,7 +148,7 @@ describe('months (local D1)', () => {
       for (const [monthNumber, isActive, memberIds] of [[10, false, [2]], [11, true, [1, 2]]] as const) {
         expect((await setActive(1, { isActive })).status).toBe(204)
         expect((await participants.all<MonthMember>()).results).toEqual(before)
-        const response = await worker.fetch(new Request('https://example.com/api/months', {
+        const response = await adminFetch(new Request('https://example.com/api/months', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ year: 2026, month: monthNumber, billAmountEuros: 0 }),
@@ -165,14 +180,14 @@ describe('months (local D1)', () => {
       expect(await storedMonth(month.id)).toEqual(month)
     })
 
-    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid member ID %s before querying D1', async (id) => {
-      const prepare = vi.spyOn(db, 'prepare')
+    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid member ID %s without writing', async (id) => {
+      const update = vi.spyOn(membersRepository, 'updateMemberActiveStatus')
 
       const response = await setActive(id, { isActive: false })
 
       expect(response.status).toBe(400)
       expect(await response.json()).toEqual({ error: 'invalid member id' })
-      expect(prepare).not.toHaveBeenCalled()
+      expect(update).not.toHaveBeenCalled()
     })
 
     it.each([
@@ -180,51 +195,59 @@ describe('months (local D1)', () => {
       { isActive: null }, { isActive: [] }, { isActive: {} },
       {}, null, [], [false], true, false, 0, 'false',
       { is_active: false }, { isActive: false, name: 'Changed' },
-    ])('rejects invalid or additional activation input %j before querying D1', async (body) => {
-      const prepare = vi.spyOn(db, 'prepare')
+    ])('rejects invalid or additional activation input %j without writing', async (body) => {
+      const update = vi.spyOn(membersRepository, 'updateMemberActiveStatus')
 
       const response = await setActive(1, body)
 
       expect(response.status).toBe(400)
       expect(await response.json()).toEqual({ error: 'expected only isActive as a boolean' })
-      expect(prepare).not.toHaveBeenCalled()
+      expect(update).not.toHaveBeenCalled()
     })
 
-    it.each(['{', ''])('rejects malformed or empty JSON %j before querying D1', async (body) => {
-      const prepare = vi.spyOn(db, 'prepare')
-      const response = await worker.fetch(new Request(
+    it.each(['{', ''])('rejects malformed or empty JSON %j without writing', async (body) => {
+      const update = vi.spyOn(membersRepository, 'updateMemberActiveStatus')
+      const response = await adminFetch(new Request(
         'https://example.com/api/admin/members/1/active', { method: 'PATCH', body },
       ), { DB: db })
 
       expect(response.status).toBe(400)
       expect(await response.json()).toEqual({ error: 'invalid JSON body' })
-      expect(prepare).not.toHaveBeenCalled()
+      expect(update).not.toHaveBeenCalled()
     })
 
     it('does not expose activation through other HTTP methods', async () => {
-      const prepare = vi.spyOn(db, 'prepare')
+      const update = vi.spyOn(membersRepository, 'updateMemberActiveStatus')
       for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
-        const response = await worker.fetch(new Request(
+        const response = await adminFetch(new Request(
           'https://example.com/api/admin/members/1/active', { method },
         ), { DB: db })
         expect(response.status).toBe(404)
       }
-      expect(prepare).not.toHaveBeenCalled()
+      expect(update).not.toHaveBeenCalled()
     })
 
-    it('propagates D1 failures over HTTP instead of returning success or 404', async () => {
+    it('returns generic HTTP 500 for activation D1 failures instead of success or 404', async () => {
+      const update = vi.spyOn(membersRepository, 'updateMemberActiveStatus')
       const failingDb = {
-        prepare: () => db.prepare('UPDATE missing_members_table SET is_active = ? WHERE id = ?'),
+        prepare: (sql: string) => db.prepare(/UPDATE\s+members\b/.test(sql)
+          ? 'UPDATE missing_members_table SET is_active = ? WHERE id = ?'
+          : sql),
       } as unknown as D1Database
 
-      await expect(worker.fetch(new Request('https://example.com/api/admin/members/1/active', {
+      const response = await adminFetch(new Request('https://example.com/api/admin/members/1/active', {
         method: 'PATCH', body: '{"isActive":false}',
-      }), { DB: failingDb })).rejects.toThrow('no such table: missing_members_table')
+      }), { DB: failingDb })
+
+      expect(update).toHaveBeenCalledWith(failingDb, 1, false)
+      expect(response.status).toBe(500)
+      expect(await response.json()).toEqual({ error: 'internal server error' })
+      expect(response.headers.get('Cache-Control')).toBe('private, no-store')
     })
   })
 
   it('returns HTTP 200 with an empty month list', async () => {
-    const response = await worker.fetch(new Request('https://example.com/api/months'), { DB: db })
+    const response = await adminFetch(new Request('https://example.com/api/months'), { DB: db })
 
     expect(response.status).toBe(200)
     expect(response.headers.get('content-type')).toContain('application/json')
@@ -251,7 +274,7 @@ describe('months (local D1)', () => {
       `).bind(september.id),
     ])
 
-    const response = await worker.fetch(new Request('https://example.com/api/months'), { DB: db })
+    const response = await adminFetch(new Request('https://example.com/api/months'), { DB: db })
 
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual([
@@ -267,18 +290,25 @@ describe('months (local D1)', () => {
     ])
   })
 
-  it('propagates D1 failures from month listing rather than returning an empty list', async () => {
+  it('returns generic HTTP 500 for month listing D1 failures rather than an empty list', async () => {
+    const read = vi.spyOn(monthsRepository, 'getAllMonths')
     const failingDb = {
-      prepare: () => db.prepare('SELECT * FROM missing_months_table'),
+      prepare: (sql: string) => db.prepare(/FROM\s+months\b/.test(sql)
+        ? 'SELECT * FROM missing_months_table'
+        : sql),
     } as unknown as D1Database
 
-    await expect(worker.fetch(new Request('https://example.com/api/months'), { DB: failingDb }))
-      .rejects.toThrow('no such table: missing_months_table')
+    const response = await adminFetch(new Request('https://example.com/api/months'), { DB: failingDb })
+
+    expect(read).toHaveBeenCalledWith(failingDb)
+    expect(response.status).toBe(500)
+    expect(await response.json()).toEqual({ error: 'internal server error' })
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store')
   })
 
   it.each([0, 2])('returns HTTP detail for a DRAFT with %i participants and no official quota', async (memberCount) => {
     const month = await seedMonth(memberCount)
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${month.id}`,
     ), { DB: db })
 
@@ -318,7 +348,7 @@ describe('months (local D1)', () => {
       .bind('2026-10-21 09:00:00', otherMonth.id).run()
     const beforeMembers = (await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results
 
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${month.id}`,
     ), { DB: db })
 
@@ -342,7 +372,7 @@ describe('months (local D1)', () => {
   })
 
   it('returns HTTP 404 for a missing month detail', async () => {
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       'https://example.com/api/months/999',
     ), { DB: db })
 
@@ -350,9 +380,9 @@ describe('months (local D1)', () => {
     expect(await response.json()).toEqual({ error: 'month not found' })
   })
 
-  it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid HTTP detail ID %s before querying D1', async (id) => {
+  it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid HTTP detail ID %s before reading the month', async (id) => {
     const read = vi.spyOn(monthsRepository, 'getMonthDetail')
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${id}`,
     ), { DB: db })
 
@@ -364,6 +394,7 @@ describe('months (local D1)', () => {
   it('backfills existing participants without changing membership or month amounts', async () => {
     const legacy = await getPlatformProxy<{ DB: D1Database }>({
       configPath: fileURLToPath(new URL('../../../wrangler.jsonc', import.meta.url)),
+      envFiles: [fileURLToPath(new URL('../../__tests__/test.env', import.meta.url))],
       persist: false,
       remoteBindings: false,
     })
@@ -466,7 +497,7 @@ describe('months (local D1)', () => {
 
   describe('draft bill editing', () => {
     function editBill(monthId: number, body: unknown) {
-      return worker.fetch(new Request(
+      return adminFetch(new Request(
         `https://example.com/api/admin/months/${monthId}/bill`,
         { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
       ), { DB: db })
@@ -497,7 +528,7 @@ describe('months (local D1)', () => {
       expect(await db.prepare('SELECT typeof(bill_amount_cents) AS type FROM months WHERE id = ?')
         .bind(month.id).first('type')).toBe('integer')
 
-      const calculation = await worker.fetch(new Request(
+      const calculation = await adminFetch(new Request(
         `https://example.com/api/months/${month.id}/calculation`,
       ), { DB: db })
       expect(calculation.status).toBe(200)
@@ -538,9 +569,9 @@ describe('months (local D1)', () => {
       expect(await storedMonth(month.id)).toEqual(month)
     })
 
-    it('rejects malformed JSON before querying D1', async () => {
+    it('rejects malformed JSON without writing', async () => {
       const update = vi.spyOn(monthsRepository, 'updateDraftMonthBill')
-      const response = await worker.fetch(new Request(
+      const response = await adminFetch(new Request(
         'https://example.com/api/admin/months/1/bill', { method: 'PATCH', body: '{' },
       ), { DB: db })
 
@@ -549,9 +580,9 @@ describe('months (local D1)', () => {
       expect(update).not.toHaveBeenCalled()
     })
 
-    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid bill route ID %s before querying D1', async (id) => {
+    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid bill route ID %s without writing', async (id) => {
       const update = vi.spyOn(monthsRepository, 'updateDraftMonthBill')
-      const response = await worker.fetch(new Request(
+      const response = await adminFetch(new Request(
         `https://example.com/api/admin/months/${id}/bill`,
         { method: 'PATCH', body: '{"billAmountEuros":34}' },
       ), { DB: db })
@@ -625,7 +656,7 @@ describe('months (local D1)', () => {
 
   describe('manual payment marking', () => {
     function markPaid(monthId: number, memberId = 1) {
-      return worker.fetch(new Request(
+      return adminFetch(new Request(
         `https://example.com/api/admin/months/${monthId}/members/${memberId}/paid`,
         { method: 'POST' },
       ), { DB: db })
@@ -662,7 +693,7 @@ describe('months (local D1)', () => {
       ))
       expect((await months.all<Month>()).results).toEqual(beforeMonths)
 
-      const detail = await worker.fetch(new Request(`https://example.com/api/months/${month.id}`), { DB: db })
+      const detail = await adminFetch(new Request(`https://example.com/api/months/${month.id}`), { DB: db })
       expect(await detail.json()).toMatchObject({
         participants: [
           { member_id: 1, payment_status: 'PAID', paid_at: paidAt },
@@ -747,10 +778,10 @@ describe('months (local D1)', () => {
       expect(await storedMonth(month.id)).toEqual(beforeMonth)
     })
 
-    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid month/member ID %s before querying D1', async (id) => {
+    it.each(['0', '-1', '1.5', 'abc', '9007199254740992', '1e2', '0x1', '%20'])('rejects invalid month/member ID %s without writing', async (id) => {
       const mark = vi.spyOn(monthsRepository, 'markMemberPaid')
       for (const path of [`${id}/members/1`, `1/members/${id}`]) {
-        const response = await worker.fetch(new Request(
+        const response = await adminFetch(new Request(
           `https://example.com/api/admin/months/${path}/paid`, { method: 'POST' },
         ), { DB: db })
         expect(response.status).toBe(400)
@@ -768,7 +799,7 @@ describe('months (local D1)', () => {
       )
       expect(request.body).not.toBeNull()
 
-      const response = await worker.fetch(request, { DB: db })
+      const response = await adminFetch(request, { DB: db })
 
       expect(response.status).toBe(204)
       expect(await db.prepare('SELECT * FROM month_members WHERE month_id = ?').bind(month.id).first<MonthMember>())
@@ -779,7 +810,7 @@ describe('months (local D1)', () => {
       const month = await seedMonth(1)
       await publishMonthAmount(db, month.id)
       const mark = vi.spyOn(monthsRepository, 'markMemberPaid')
-      const response = await worker.fetch(new Request(
+      const response = await adminFetch(new Request(
         `https://example.com/api/admin/months/${month.id}/members/1/paid`,
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
       ), { DB: db })
@@ -794,7 +825,7 @@ describe('months (local D1)', () => {
     it('does not expose payment marking or reversal through other HTTP methods', async () => {
       const mark = vi.spyOn(monthsRepository, 'markMemberPaid')
       for (const method of ['GET', 'PATCH', 'DELETE']) {
-        const response = await worker.fetch(new Request(
+        const response = await adminFetch(new Request(
           'https://example.com/api/admin/months/1/members/1/paid', { method },
         ), { DB: db })
         expect(response.status).toBe(404)
@@ -994,14 +1025,14 @@ describe('months (local D1)', () => {
 
     await expect(monthsRepository.addMemberToDraftMonth(db, month.id, 1)).resolves.toBe(false)
     await expect(includeMemberInMonth(db, month.id, 1)).rejects.toBeInstanceOf(MemberNotActiveError)
-    const rejected = await worker.fetch(new Request(url, { method: 'POST' }), { DB: db })
+    const rejected = await adminFetch(new Request(url, { method: 'POST' }), { DB: db })
     expect(rejected.status).toBe(409)
     expect(await rejected.json()).toEqual({ error: 'member is not active' })
     expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(false)
 
     await setMemberActiveStatus(db, 1, true)
     expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(false)
-    expect((await worker.fetch(new Request(url, { method: 'POST' }), { DB: db })).status).toBe(204)
+    expect((await adminFetch(new Request(url, { method: 'POST' }), { DB: db })).status).toBe(204)
     expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(true)
   })
 
@@ -1054,13 +1085,13 @@ describe('months (local D1)', () => {
     const url = `https://example.com/api/months/${month.id}/members/1`
 
     for (const method of ['POST', 'DELETE', 'POST']) {
-      const response = await worker.fetch(new Request(url, { method }), { DB: db })
+      const response = await adminFetch(new Request(url, { method }), { DB: db })
       expect(response.status).toBe(204)
       expect(await response.text()).toBe('')
       expect(await monthsRepository.isMemberInMonth(db, month.id, 1)).toBe(method === 'POST')
     }
 
-    const duplicate = await worker.fetch(new Request(url, { method: 'POST' }), { DB: db })
+    const duplicate = await adminFetch(new Request(url, { method: 'POST' }), { DB: db })
     expect(duplicate.status).toBe(409)
     expect(await duplicate.json()).toEqual({ error: 'member is already included in month' })
   })
@@ -1085,7 +1116,7 @@ describe('months (local D1)', () => {
       await db.prepare('UPDATE months SET status = ? WHERE id = ?').bind(state, month.id).run()
     }
 
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${month.id}/members/1`, { method: 'POST' },
     ), { DB: db })
 
@@ -1101,7 +1132,7 @@ describe('months (local D1)', () => {
     '1/members/9007199254740992',
   ])('rejects invalid HTTP inclusion IDs: %s', async (path) => {
     const add = vi.spyOn(monthsRepository, 'addMemberToDraftMonth')
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${path}`, { method: 'POST' },
     ), { DB: db })
 
@@ -1121,7 +1152,7 @@ describe('months (local D1)', () => {
       return added
     })
 
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${month.id}/members/1`, { method: 'POST' },
     ), { DB: db })
 
@@ -1142,7 +1173,7 @@ describe('months (local D1)', () => {
       return removed
     })
 
-    const response = await worker.fetch(new Request(
+    const response = await adminFetch(new Request(
       `https://example.com/api/months/${month.id}/members/1`, { method: 'DELETE' },
     ), { DB: db })
 

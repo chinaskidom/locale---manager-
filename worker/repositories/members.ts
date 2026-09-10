@@ -1,5 +1,12 @@
 import type { Member } from '../types'
 
+export async function getMemberIdByEmail(db: D1Database, email: string): Promise<number | null> {
+  const { results } = await db.prepare('SELECT id, email FROM members').all<Pick<Member, 'id' | 'email'>>()
+  // Normalize both sides in JS: SQLite LOWER/TRIM have narrower case/whitespace rules.
+  const matches = results.filter((member) => member.email.trim().toLowerCase() === email.trim().toLowerCase())
+  return matches.length === 1 ? matches[0].id : null
+}
+
 export async function updateMemberActiveStatus(
   db: D1Database,
   memberId: number,

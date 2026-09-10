@@ -1,3 +1,4 @@
+import { authorize } from './auth'
 import {
   InvalidMonthInputError,
   MemberAlreadyInMonthError,
@@ -25,10 +26,6 @@ import {
   updateMonthBill,
 } from './services/months'
 
-interface Env {
-  DB: D1Database
-}
-
 function parsePositiveId(value: string): number | null {
   const id = Number(value)
 
@@ -37,11 +34,11 @@ function parsePositiveId(value: string): number | null {
     : null
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+const api = {
+  async fetch(request: Request, env: Env, isAdmin: boolean): Promise<Response> {
     const url = new URL(request.url)
 
-    if (url.pathname === '/api/health') {
+    if (url.pathname === '/api/health' && request.method === 'GET') {
       return Response.json({
         status: 'ok',
       })
@@ -96,7 +93,10 @@ export default {
       url.pathname === '/api/months' &&
       request.method === 'GET'
     ) {
-      return Response.json(await listMonths(env.DB))
+      const months = await listMonths(env.DB)
+      return Response.json(isAdmin ? months : months.filter((month) =>
+        month.status === 'PUBLISHED' || month.status === 'CLOSED',
+      ))
     }
 
     const monthMatch = url.pathname.match(/^\/api\/months\/([^/]+)$/)
@@ -114,7 +114,11 @@ export default {
       }
 
       try {
-        return Response.json(await getMonthDetail(env.DB, monthId))
+        const month = await getMonthDetail(env.DB, monthId)
+        if (!isAdmin && month.status !== 'PUBLISHED' && month.status !== 'CLOSED') {
+          throw new MonthNotFoundError()
+        }
+        return Response.json(month)
       } catch (error) {
         if (error instanceof MonthNotFoundError) {
           return Response.json(
@@ -343,7 +347,6 @@ export default {
     )
 
     if (paymentMatch && request.method === 'POST') {
-      // Manual administrator confirmation; protect this route when authorization is added.
       const monthId = /^\d+$/.test(paymentMatch[1]) ? parsePositiveId(paymentMatch[1]) : null
       const memberId = /^\d+$/.test(paymentMatch[2]) ? parsePositiveId(paymentMatch[2]) : null
 
@@ -430,5 +433,22 @@ export default {
     return new Response('Not Found', {
       status: 404,
     })
+  },
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    let response: Response
+    try {
+      const authorization = await authorize(request, env)
+      response = typeof authorization === 'boolean'
+        ? await api.fetch(request, env, authorization)
+        : authorization
+    } catch {
+      // Never leak database errors, claims, or authentication configuration.
+      response = Response.json({ error: 'internal server error' }, { status: 500 })
+    }
+    response.headers.set('Cache-Control', 'private, no-store')
+    return response
   },
 }

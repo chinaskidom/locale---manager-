@@ -4,6 +4,10 @@
   "compatibility_date": "2026-09-05",
   "main": "./worker/index.ts",
 
+  "secrets": {
+    "required": ["ACCESS_ISSUER", "ACCESS_AUD", "ADMIN_EMAIL", "APP_ORIGIN"]
+  },
+
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": [
