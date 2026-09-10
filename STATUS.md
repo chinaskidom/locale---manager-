@@ -2,18 +2,17 @@
 
 ## Last completed work
 
-- Finished the interrupted Cloudflare Access authentication/authorization implementation without replacing existing work. Verified RS256 assertions must match the configured issuer/audience and exactly one existing member; administrator access uses the configured email, and mutations require the exact configured Origin.
-- Members can read health and PUBLISHED/CLOSED months only; DRAFT details are hidden. Other routes default to administrator-only. Worker responses use private/no-store caching and generic errors.
-- Retained tunnel-only interactive development settings, disabled local Explorer/observability, sensitive-file protection, and signed authentication/SQL regressions. Fixed the Vite security test to expect the Worker's 401, corrected its NodeNext import and optional config field types, and replaced deprecated `envFile` with `envDir`.
-- Removed the unused returned JWKS fixture property and replaced duplicate Explorer response-body checks with one exact-body assertion; status/cache checks remain unchanged.
-- Verification passed: `npm run lint`, `npm test` (321 tests, including 108 authentication tests), `npm run build`, and `git diff --check`.
+- User confirmed the real-browser Access/named-tunnel smoke test succeeded: OTP and real JWT verification, health 200, ADMIN member listing 200, localhost 401, MEMBER health 200/member listing 403, MEMBER DRAFT detail 404 and DRAFT filtering, HMR, and ADMIN same-origin PATCH 204.
+- The earlier live 401 was caused by an incorrect `ACCESS_AUD` in local `.dev.vars`. Correcting configuration resolved it; authentication architecture and verification rules were not changed.
+- Removed temporary diagnostic instrumentation, its Vite flag, diagnostic-only tests, and instructions. Updated `README.md` with the successful live results and production prerequisites; no personal configuration values were added, and `.dev.vars` remains ignored.
+- Cleanup verification passed: focused auth/tunnel tests (111/111, including 108 auth tests), `npm run lint`, `npm run build`, and `git diff --check`. The full suite was not rerun because production authentication behavior is unchanged.
 
 ## Important unresolved issues
 
 - Direct SQL writes that bypass guarded repository statements can still modify frozen month fields, membership, or payment state; no schema-wide lifecycle guard was added.
 - Membership and bill-edit failure diagnosis reread current state after a guarded no-op; concurrent changes can obscure the original cause. Payment outcome diagnosis stays in the write transaction.
-- Authentication tests use synthetic Access identities and isolated local D1; live Cloudflare Access policy/tunnel and deployed D1 verification remain missing. SPA protection requires an external Access policy.
-- Build succeeds but warns that `ACCESS_ISSUER`, `ACCESS_AUD`, `ADMIN_EMAIL`, and `APP_ORIGIN` are unset. Deployment D1 IDs remain local-development placeholders; frontend API integration is still missing.
+- Production hostname/whole-hostname Access policy, production server-side auth configuration, real D1 IDs/migrations/member rows, and deployed routing/auth verification remain prerequisites; no production deployment was performed. Frontend API integration is still missing.
+- Foreign/missing/null-Origin rejection, inactive-member login, and other checklist cases not listed above were not reported as live-tested. The 30-day session duration is a dashboard configuration requirement, not an elapsed-time verification result.
 - The business rule for closing a PUBLISHED month remains undecided.
 
 ## Current state
@@ -30,4 +29,4 @@
 
 ## Next planned task
 
-Confirm the next V1 development task with the user; no further implementation scope is selected.
+Confirm the next development task with the user; no further implementation scope is selected.

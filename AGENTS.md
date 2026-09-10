@@ -27,7 +27,7 @@
 
 ## Wiring
 
-- `README.md` is still the Vite template. The browser entry is `src/main.tsx`; `src/App.tsx` is only a heading, with no API integration yet. Tailwind v4 is wired through Vite and `src/index.css`, not a Tailwind config file.
+- `README.md` documents local Cloudflare Access/named-tunnel setup and browser smoke tests. The browser entry is `src/main.tsx`; `src/App.tsx` is only a heading, with no API integration yet. Tailwind v4 is wired through Vite and `src/index.css`, not a Tailwind config file.
 - `worker/index.ts` implements HTTP routing and maps domain error classes to responses. Month business rules live in `worker/services/months.ts`; D1 SQL lives in `worker/repositories/`. Services receive `D1Database` explicitly. Row types in `worker/types.ts` mirror snake_case database columns, not camelCase request fields.
 - `wrangler.jsonc` sends `/api/*` to the Worker before asset handling and uses SPA fallback for frontend paths. API routes belong under that prefix.
 
