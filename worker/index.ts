@@ -1,4 +1,5 @@
 import { authorize } from './auth'
+import type { AuthenticatedIdentity } from './auth'
 import {
   InvalidMonthInputError,
   MemberAlreadyInMonthError,
@@ -16,6 +17,7 @@ import { getAllMembers } from './repositories/members'
 import { setMemberActiveStatus } from './services/members'
 import {
   calculateMonthAmount,
+  closeMonth,
   createDraftMonth,
   getMonthDetail,
   publishMonthAmount,
@@ -35,8 +37,13 @@ function parsePositiveId(value: string): number | null {
 }
 
 const api = {
-  async fetch(request: Request, env: Env, isAdmin: boolean): Promise<Response> {
+  async fetch(request: Request, env: Env, identity: AuthenticatedIdentity): Promise<Response> {
     const url = new URL(request.url)
+    const isAdmin = identity.role === 'ADMIN'
+
+    if (url.pathname === '/api/me' && request.method === 'GET') {
+      return Response.json({ memberId: identity.memberId, name: identity.name, role: identity.role })
+    }
 
     if (url.pathname === '/api/health' && request.method === 'GET') {
       return Response.json({
@@ -342,6 +349,35 @@ const api = {
       }
     }
 
+    const closeMatch = url.pathname.match(/^\/api\/admin\/months\/([^/]+)\/close$/)
+
+    if (closeMatch && request.method === 'POST') {
+      const monthId = /^\d+$/.test(closeMatch[1]) ? parsePositiveId(closeMatch[1]) : null
+
+      if (monthId === null) {
+        return Response.json({ error: 'invalid month id' }, { status: 400 })
+      }
+
+      if (await request.text()) {
+        return Response.json({ error: 'request body is not allowed' }, { status: 400 })
+      }
+
+      try {
+        await closeMonth(env.DB, monthId)
+        return new Response(null, { status: 204 })
+      } catch (error) {
+        if (error instanceof MonthNotFoundError) {
+          return Response.json({ error: error.message }, { status: 404 })
+        }
+
+        if (error instanceof MonthNotEditableError) {
+          return Response.json({ error: error.message }, { status: 409 })
+        }
+
+        throw error
+      }
+    }
+
     const paymentMatch = url.pathname.match(
       /^\/api\/admin\/months\/([^/]+)\/members\/([^/]+)\/paid$/,
     )
@@ -441,9 +477,9 @@ export default {
     let response: Response
     try {
       const authorization = await authorize(request, env)
-      response = typeof authorization === 'boolean'
-        ? await api.fetch(request, env, authorization)
-        : authorization
+      response = authorization instanceof Response
+        ? authorization
+        : await api.fetch(request, env, authorization)
     } catch {
       // Never leak database errors, claims, or authentication configuration.
       response = Response.json({ error: 'internal server error' }, { status: 500 })

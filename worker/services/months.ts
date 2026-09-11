@@ -1,5 +1,6 @@
 import {
   addMemberToDraftMonth,
+  closePublishedMonth,
   createMonth as insertMonth,
   getAllMonths,
   getMonthCalculationData,
@@ -126,6 +127,18 @@ export async function publishMonthAmount(
   }
 
   return perMemberAmountCents
+}
+
+export async function closeMonth(db: D1Database, monthId: number): Promise<void> {
+  const status = await closePublishedMonth(db, monthId)
+
+  if (status === null) {
+    throw new MonthNotFoundError()
+  }
+
+  if (status !== 'CLOSED') {
+    throw new MonthNotEditableError()
+  }
 }
 
 export async function markMemberPaymentPaid(

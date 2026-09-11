@@ -14,6 +14,7 @@ const mutations = [
   ['DELETE', '/api/months/1/members/1', undefined, 204],
   ['PATCH', '/api/admin/months/1/bill', { billAmountEuros: 50 }, 204],
   ['POST', '/api/admin/months/2/members/2/paid', undefined, 204],
+  ['POST', '/api/admin/months/2/close', undefined, 204],
   ['PATCH', '/api/admin/members/2/active', { isActive: false }, 204],
 ] as const
 
@@ -85,6 +86,58 @@ describe('Access authentication and API authorization (real verifier and local D
     expect(response.headers.has('Access-Control-Allow-Origin')).toBe(false)
     return response
   }
+
+  describe('GET /api/me', () => {
+    it.each([
+      ['admin@example.test', 1, 'Admin', 'ADMIN'],
+      ['member@example.test', 2, 'Member', 'MEMBER'],
+      ['inactive@example.test', 3, 'Inactive', 'MEMBER'],
+    ])('returns only safe identity data for %s', async (email, memberId, name, role) => {
+      const token = await auth.sign(email, { role: 'ADMIN', name: 'Untrusted name', secret: 'private-claim' })
+      const lookup = vi.spyOn(await import('../repositories/members'), 'getMemberIdentityByEmail')
+      const response = await call(token, '/api/me', { headers: { 'X-Role': 'ADMIN' } })
+      expect(response.status).toBe(200)
+      const body = await response.json()
+      expect(body).toEqual({ memberId, name, role })
+      expect(JSON.stringify(body)).not.toMatch(/email|@|secret|private-claim|sub|test-human-id|identity_nonce|test-nonce|is_active|created_at|ACCESS_|ADMIN_EMAIL|cloudflareaccess/)
+      expect([...response.headers.keys()].sort()).toEqual(['cache-control', 'content-type'])
+      expect(lookup).toHaveBeenCalledExactlyOnceWith(db, email)
+    })
+
+    it('uses ADMIN_EMAIL for role even when the resolved member is inactive', async () => {
+      const response = await call(inactiveToken, '/api/me', {}, { ADMIN_EMAIL: ' INACTIVE@EXAMPLE.TEST ' })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({ memberId: 3, name: 'Inactive', role: 'ADMIN' })
+    })
+
+    it.each([null, 'not-a-jwt'])('rejects missing/invalid authentication %s before D1', async (token) => {
+      const lookup = vi.spyOn(await import('../repositories/members'), 'getMemberIdentityByEmail')
+      const response = await call(token, '/api/me')
+      expect(response.status).toBe(401)
+      expect(await response.json()).toEqual({ error: 'unauthorized' })
+      expect(lookup).not.toHaveBeenCalled()
+    })
+
+    it('rejects an invalid signed identity', async () => {
+      const response = await call(await auth.sign(undefined, { type: 'service' }), '/api/me')
+      expect(response.status).toBe(401)
+      expect(await response.json()).toEqual({ error: 'unauthorized' })
+    })
+
+    it('rejects an unknown member', async () => {
+      const response = await call(await auth.sign('unknown@example.test'), '/api/me')
+      expect(response.status).toBe(403)
+      expect(await response.json()).toEqual({ error: 'forbidden' })
+    })
+
+    it.each(['admin@example.test', 'member@example.test'])('rejects ambiguous identity %s', async (email) => {
+      await db.prepare('INSERT INTO members (name, email, is_active) VALUES (?, ?, 0)')
+        .bind('Duplicate', `\t${email.toUpperCase()} `).run()
+      const response = await call(await auth.sign(email), '/api/me')
+      expect(response.status).toBe(403)
+      expect(await response.json()).toEqual({ error: 'forbidden' })
+    })
+  })
 
   async function snapshot() {
     return db.batch([

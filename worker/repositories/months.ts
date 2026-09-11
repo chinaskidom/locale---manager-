@@ -126,6 +126,20 @@ export async function publishMonth(
     : null
 }
 
+export async function closePublishedMonth(db: D1Database, monthId: number): Promise<MonthStatus | null> {
+  // Keep the guarded transition and its outcome read in the same transaction.
+  const [, result] = await db.batch<{ status: MonthStatus }>([
+    db.prepare(`
+      UPDATE months
+      SET status = 'CLOSED', closed_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'PUBLISHED'
+    `).bind(monthId),
+    db.prepare('SELECT status FROM months WHERE id = ?').bind(monthId),
+  ])
+
+  return result.results[0]?.status ?? null
+}
+
 interface MonthPaymentState {
   status: MonthStatus
   payment_status: PaymentStatus | null

@@ -29,9 +29,11 @@ Months have exactly these states:
 | --- | --- |
 | DRAFT | The bill and participation can be changed; the quota may be calculated as a preview. |
 | PUBLISHED | Participating members and the official per-member amount are frozen; membership is no longer editable. |
-| CLOSED | Final state for a completed month. |
+| CLOSED | Final, immutable state after an explicit administrator close action. |
 
-The exact rule allowing a PUBLISHED month to become CLOSED is undecided and must not be invented.
+Closing is an explicit ADMIN-only action from PUBLISHED to CLOSED and is never automatic. A PUBLISHED month may be closed regardless of payment statuses; some or all participants being UNPAID must not prevent closing. DRAFT cannot be closed.
+
+Closing changes only the month status and `closed_at`, generated server-side/database-side on the first close. It preserves membership, bill and fixed amounts, the frozen per-member quota, due date, `published_at`, payment statuses, and `paid_at`. Repeated close requests for a CLOSED month succeed without modifying it or replacing the original `closed_at`; concurrent close attempts must be safe.
 
 ## Payments
 
@@ -54,7 +56,7 @@ The exact rule allowing a PUBLISHED month to become CLOSED is undecided and must
 
 ## Administration
 
-The administrator must be able to create and manage months, enter the monthly bill, manage DRAFT participation, publish a month, inspect member/payment status, mark payments manually, eventually close a month, and manage members as required for the V1 workflow.
+The administrator must be able to create and manage months, enter the monthly bill, manage DRAFT participation, publish a month, inspect member/payment status, mark payments manually, explicitly close a PUBLISHED month, and manage members as required for the V1 workflow.
 
 Exact UI screens and endpoint shapes should follow the simplest architecture consistent with these requirements.
 

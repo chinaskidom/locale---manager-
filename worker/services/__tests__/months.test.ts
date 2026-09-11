@@ -13,6 +13,7 @@ import {
 } from '../../errors/months'
 import {
   calculatePerMemberAmount,
+  closeMonth,
   publishMonthAmount,
   createDraftMonth,
   excludeMemberFromMonth,
@@ -42,6 +43,16 @@ describe('getMonthDetail', () => {
     vi.spyOn(monthsRepository, 'getMonthDetail').mockRejectedValue(error)
 
     await expect(getMonthDetail(db, 1)).rejects.toBe(error)
+  })
+})
+
+describe('closeMonth', () => {
+  beforeEach(() => vi.restoreAllMocks())
+
+  it('propagates database failures without reporting success or a missing month', async () => {
+    const error = new Error('database unavailable')
+    vi.spyOn(monthsRepository, 'closePublishedMonth').mockRejectedValue(error)
+    await expect(closeMonth({} as D1Database, 1)).rejects.toBe(error)
   })
 })
 

@@ -18,7 +18,7 @@ import * as membersRepository from '../../repositories/members'
 import * as monthsRepository from '../../repositories/months'
 import type { Member, Month, MonthMember } from '../../types'
 import { setMemberActiveStatus } from '../members'
-import { calculatePerMemberAmount, createDraftMonth, excludeMemberFromMonth, includeMemberInMonth, publishMonthAmount, updateMonthBill } from '../months'
+import { calculatePerMemberAmount, closeMonth, createDraftMonth, excludeMemberFromMonth, includeMemberInMonth, publishMonthAmount, updateMonthBill } from '../months'
 
 describe('months (local D1)', () => {
   let platform: PlatformProxy<{ DB: D1Database }>
@@ -81,6 +81,117 @@ describe('months (local D1)', () => {
   async function storedMonth(monthId: number) {
     return db.prepare('SELECT * FROM months WHERE id = ?').bind(monthId).first<Month>()
   }
+
+  describe('manual month closing', () => {
+    function close(monthId: number | string, body?: string) {
+      return adminFetch(new Request(`https://example.com/api/admin/months/${monthId}/close`, {
+        method: 'POST', body,
+      }), { DB: db })
+    }
+
+    it.each([0, 1, 3])('closes with %i of 3 participants PAID and preserves every other field', async (paidCount) => {
+      const month = await seedMonth(3)
+      await publishMonthAmount(db, month.id)
+      await db.prepare("UPDATE months SET published_at = '2000-01-01 12:00:00' WHERE id = ?")
+        .bind(month.id).run()
+      await db.prepare(`UPDATE month_members SET payment_status = 'PAID', paid_at = '2000-01-21 12:00:00'
+        WHERE month_id = ? AND member_id <= ?`).bind(month.id, paidCount).run()
+      const before = await storedMonth(month.id)
+      const participants = await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()
+      const earliest = await db.prepare('SELECT CURRENT_TIMESTAMP AS now').first<string>('now')
+
+      const response = await close(month.id)
+
+      expect(response.status).toBe(204)
+      expect(await response.text()).toBe('')
+      expect(response.headers.get('Cache-Control')).toBe('private, no-store')
+      const after = await storedMonth(month.id)
+      const latest = await db.prepare('SELECT CURRENT_TIMESTAMP AS now').first<string>('now')
+      expect(after).toEqual({ ...before, status: 'CLOSED', closed_at: expect.any(String) })
+      expect(after!.closed_at! >= earliest! && after!.closed_at! <= latest!).toBe(true)
+      expect((await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results)
+        .toEqual(participants.results)
+    })
+
+    it('guards DRAFT in SQL and rejects it through the service and HTTP without mutation', async () => {
+      const month = await seedMonth(2)
+      expect(await monthsRepository.closePublishedMonth(db, month.id)).toBe('DRAFT')
+      await expect(closeMonth(db, month.id)).rejects.toBeInstanceOf(MonthNotEditableError)
+      const response = await close(month.id)
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({ error: 'month is not editable' })
+      expect(await storedMonth(month.id)).toEqual(month)
+    })
+
+    it('returns missing month through repository, service, and HTTP without inserting it', async () => {
+      expect(await monthsRepository.closePublishedMonth(db, 999)).toBeNull()
+      await expect(closeMonth(db, 999)).rejects.toBeInstanceOf(MonthNotFoundError)
+      const response = await close(999)
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({ error: 'month not found' })
+      expect(await storedMonth(999)).toBeNull()
+    })
+
+    it('preserves an existing closed_at on service and HTTP retries, including concurrent retries', async () => {
+      const month = await seedMonth(2)
+      await publishMonthAmount(db, month.id)
+      await closeMonth(db, month.id)
+      // A distinct old timestamp catches accidental rewrites even within the same second.
+      await db.prepare("UPDATE months SET closed_at = '2000-02-01 12:00:00' WHERE id = ?").bind(month.id).run()
+      const before = await storedMonth(month.id)
+      await closeMonth(db, month.id)
+      const responses = await Promise.all([close(month.id), close(month.id)])
+      expect(responses.map((response) => response.status)).toEqual([204, 204])
+      expect(await storedMonth(month.id)).toEqual(before)
+    })
+
+    it('accepts concurrent first closes and subsequent retries', async () => {
+      const month = await seedMonth(2)
+      await publishMonthAmount(db, month.id)
+      const responses = await Promise.all([close(month.id), close(month.id), close(month.id)])
+      expect(responses.map((response) => response.status)).toEqual([204, 204, 204])
+      const closed = await storedMonth(month.id)
+      expect(closed).toMatchObject({ status: 'CLOSED', closed_at: expect.any(String) })
+      expect((await close(month.id)).status).toBe(204)
+      expect(await storedMonth(month.id)).toEqual(closed)
+    })
+
+    it('keeps the closed month immutable through existing mutation endpoints', async () => {
+      const month = await seedMonth(2)
+      await publishMonthAmount(db, month.id)
+      await closeMonth(db, month.id)
+      const before = await storedMonth(month.id)
+      const participants = (await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results
+      for (const [method, path, body] of [
+        ['PATCH', `/api/admin/months/${month.id}/bill`, '{"billAmountEuros":99}'],
+        ['POST', `/api/months/${month.id}/publish`, undefined],
+        ['POST', `/api/months/${month.id}/members/1`, undefined],
+        ['DELETE', `/api/months/${month.id}/members/1`, undefined],
+        ['POST', `/api/admin/months/${month.id}/members/1/paid`, undefined],
+      ]) {
+        const response = await adminFetch(new Request(`https://example.com${path}`, { method, body }), { DB: db })
+        expect(response.status).toBe(409)
+      }
+      expect(await storedMonth(month.id)).toEqual(before)
+      expect((await db.prepare('SELECT * FROM month_members ORDER BY id').all<MonthMember>()).results).toEqual(participants)
+    })
+
+    it.each(['0', '-1', '1.5', '1e2', 'abc', '9007199254740992'])('rejects invalid month ID %s', async (id) => {
+      const response = await close(id)
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid month id' })
+    })
+
+    it.each(['{}', 'null', ' ', '{"closed_at":"2000-01-01"}'])('rejects nonempty body %s without closing', async (body) => {
+      const month = await seedMonth(1)
+      await publishMonthAmount(db, month.id)
+      const before = await storedMonth(month.id)
+      const response = await close(month.id, body)
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'request body is not allowed' })
+      expect(await storedMonth(month.id)).toEqual(before)
+    })
+  })
 
   describe('global member activation', () => {
     function setActive(memberId: number | string, body: unknown) {

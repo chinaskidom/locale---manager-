@@ -1,9 +1,15 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose'
-import { getMemberIdByEmail } from './repositories/members'
+import { getMemberIdentityByEmail } from './repositories/members'
+
+export type AuthenticatedIdentity = {
+  memberId: number
+  name: string
+  role: 'ADMIN' | 'MEMBER'
+}
 
 let keySet: { issuer: string; keys: ReturnType<typeof createRemoteJWKSet> } | undefined
 
-export async function authorize(request: Request, env: Env): Promise<boolean | Response> {
+export async function authorize(request: Request, env: Env): Promise<AuthenticatedIdentity | Response> {
   let adminEmail: string
   try {
     const origin = new URL(env.APP_ORIGIN)
@@ -56,7 +62,8 @@ export async function authorize(request: Request, env: Env): Promise<boolean | R
     return Response.json({ error: 'unauthorized' }, { status: 401 })
   }
 
-  if (await getMemberIdByEmail(env.DB, email) === null) {
+  const member = await getMemberIdentityByEmail(env.DB, email)
+  if (member === null) {
     return Response.json({ error: 'forbidden' }, { status: 403 })
   }
 
@@ -64,7 +71,7 @@ export async function authorize(request: Request, env: Env): Promise<boolean | R
   const path = new URL(request.url).pathname
   // Only these GET routes are member-readable; new routes default to administrator-only.
   if (!isAdmin && !(request.method === 'GET' && (
-    path === '/api/health' || path === '/api/months' || /^\/api\/months\/\d+$/.test(path)
+    path === '/api/me' || path === '/api/health' || path === '/api/months' || /^\/api\/months\/\d+$/.test(path)
   ))) {
     return Response.json({ error: 'forbidden' }, { status: 403 })
   }
@@ -74,5 +81,5 @@ export async function authorize(request: Request, env: Env): Promise<boolean | R
     return Response.json({ error: 'forbidden' }, { status: 403 })
   }
 
-  return isAdmin
+  return { memberId: member.id, name: member.name, role: isAdmin ? 'ADMIN' : 'MEMBER' }
 }
