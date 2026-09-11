@@ -4,10 +4,11 @@ import { generateKeyPair, SignJWT } from 'jose'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getPlatformProxy, unstable_splitSqlQuery } from 'wrangler'
 import type { PlatformProxy } from 'wrangler'
-import type { Month, MonthDetail } from '../types'
+import type { Member, Month, MonthDetail, MonthMember } from '../types'
 import { authConfig, createAuthFixture } from './auth-fixture'
 
 const mutations = [
+  ['POST', '/api/admin/members', { name: 'New Member', email: 'new@example.test' }, 201],
   ['POST', '/api/months', { year: 2026, month: 12, billAmountEuros: 32 }, 201],
   ['POST', '/api/months/1/publish', undefined, 200],
   ['POST', '/api/months/1/members/2', undefined, 204],
@@ -87,6 +88,151 @@ describe('Access authentication and API authorization (real verifier and local D
     return response
   }
 
+  describe('POST /api/admin/members', () => {
+    function create(body: unknown) {
+      return call(adminToken, '/api/admin/members', {
+        method: 'POST', headers: { Origin: authConfig.APP_ORIGIN }, body: JSON.stringify(body),
+      })
+    }
+
+    it('creates an active member with trimmed values and an exact minimal response', async () => {
+      const response = await create({ name: ' \tNew Member\n', email: '\u00a0NeW@Example.Test\uFEFF' })
+      expect(response.status).toBe(201)
+      const body = await response.json() as { memberId: number; name: string }
+      expect(body).toEqual({ memberId: expect.any(Number), name: 'New Member' })
+      expect(await db.prepare('SELECT * FROM members WHERE id = ?').bind(body.memberId).first<Member>())
+        .toEqual({ id: body.memberId, name: 'New Member', email: 'new@example.test', is_active: 1, created_at: expect.any(String) })
+      const identity = await call(await auth.sign(' NEW@EXAMPLE.TEST '), '/api/me')
+      expect(identity.status).toBe(200)
+      expect(await identity.json()).toEqual({ ...body, role: 'MEMBER' })
+    })
+
+    it.each([
+      null, [], 'member', 1, {}, { name: 'Name' }, { email: 'new@example.test' },
+      { name: 1, email: 'new@example.test' }, { name: 'Name', email: false },
+      { name: '', email: 'new@example.test' }, { name: ' \t\n', email: 'new@example.test' },
+      { name: 'Name', email: '' }, { name: 'Name', email: ' \t\n' },
+      { name: 'Name', email: 'not-an-email' }, { name: 'Name', email: '@example.test' },
+      { name: 'Name', email: 'name@' }, { name: 'Name', email: 'a@@example.test' },
+      { name: 'Name', email: 'a b@example.test' },
+    ])('rejects invalid input %j without mutation', async (body) => {
+      const before = await snapshot()
+      expect((await create(body)).status).toBe(400)
+      expect(await snapshot()).toEqual(before)
+    })
+
+    it.each(['id', 'isActive', 'is_active', 'createdAt', 'role', 'payment_status', 'paid_at', 'extra'])(
+      'rejects extra field %s without mutation', async (field) => {
+        const before = await snapshot()
+        expect((await create({ name: 'Name', email: 'new@example.test', [field]: 'untrusted' })).status).toBe(400)
+        expect(await snapshot()).toEqual(before)
+      },
+    )
+
+    it.each(['', '{'])('rejects empty/malformed JSON %s', async (body) => {
+      const before = await snapshot()
+      const response = await call(adminToken, '/api/admin/members', {
+        method: 'POST', headers: { Origin: authConfig.APP_ORIGIN }, body,
+      })
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid JSON body' })
+      expect(await snapshot()).toEqual(before)
+    })
+
+    it.each(['new@example.test', 'NEW@EXAMPLE.TEST', ' \tNew@Example.Test\n'])(
+      'rejects duplicate email %s without mutation', async (email) => {
+        expect((await create({ name: 'Original', email: 'new@example.test' })).status).toBe(201)
+        const before = await snapshot()
+        const response = await create({ name: 'Duplicate', email })
+        expect(response.status).toBe(409)
+        expect(await response.json()).toEqual({ error: 'member email already exists' })
+        expect(await snapshot()).toEqual(before)
+      },
+    )
+
+    it.each(['member@example.test', ' INACTIVE@EXAMPLE.TEST '])('rejects legacy/noncanonical and inactive identity %s', async (email) => {
+      const before = await snapshot()
+      expect((await create({ name: 'Duplicate', email })).status).toBe(409)
+      expect(await snapshot()).toEqual(before)
+    })
+
+    it('rejects already-ambiguous legacy identities rather than treating them as available', async () => {
+      await db.prepare('INSERT INTO members (name, email) VALUES (?, ?)').bind('Duplicate', 'member@example.test').run()
+      const before = await snapshot()
+      expect((await create({ name: 'Another', email: ' MEMBER@example.test ' })).status).toBe(409)
+      expect(await snapshot()).toEqual(before)
+    })
+
+    it('uses the same Unicode case/whitespace normalization as authentication for legacy rows', async () => {
+      await db.prepare('INSERT INTO members (name, email) VALUES (?, ?)').bind('Legacy', '\u2003ÜSER@EXAMPLE.TEST\uFEFF').run()
+      expect((await create({ name: 'Duplicate', email: 'üser@example.test' })).status).toBe(409)
+    })
+
+    it('lets the database reject concurrent canonical duplicates even when both prechecks see no match', async () => {
+      const repository = await import('../repositories/members')
+      const members = await repository.getAllMembers(db)
+      // Force the stale-read race; both writes still run against real D1 and its UNIQUE constraint.
+      vi.spyOn(repository, 'getAllMembers').mockResolvedValue(members)
+      const responses = await Promise.all([
+        create({ name: 'First', email: ' Race@Example.Test ' }),
+        create({ name: 'Second', email: '\tRACE@example.test\n' }),
+      ])
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 409])
+      expect(await responses.find((response) => response.status === 409)!.json())
+        .toEqual({ error: 'member email already exists' })
+      const rows = (await db.prepare('SELECT * FROM members WHERE email = ?').bind('race@example.test').all<Member>()).results
+      expect(rows).toHaveLength(1)
+      expect(rows[0].is_active).toBe(1)
+    })
+
+    it('preserves dots and plus tags instead of applying provider-specific normalization', async () => {
+      for (const email of ['foo.bar@gmail.com', 'foobar@gmail.com', 'foo.bar+tag@gmail.com']) {
+        expect((await create({ name: 'Name', email })).status).toBe(201)
+      }
+    })
+
+    it('preserves every existing snapshot and supports future snapshots and separate explicit DRAFT inclusion', async () => {
+      const before = await snapshot()
+      const response = await create({ name: 'New Member', email: 'new@example.test' })
+      expect(response.status).toBe(201)
+      const { memberId } = await response.json() as { memberId: number }
+      const after = await snapshot()
+      expect(after[0].filter((member) => member.id !== memberId)).toEqual(before[0])
+      expect(after.slice(1)).toEqual(before.slice(1))
+
+      const future = await call(adminToken, '/api/months', {
+        method: 'POST', headers: { Origin: authConfig.APP_ORIGIN },
+        body: JSON.stringify({ year: 2026, month: 12, billAmountEuros: 32 }),
+      })
+      expect(future.status).toBe(201)
+      const month = await future.json() as Month
+      expect(await db.prepare('SELECT * FROM month_members WHERE month_id = ? AND member_id = ?')
+        .bind(month.id, memberId).first<MonthMember>()).toMatchObject({ payment_status: 'UNPAID', paid_at: null })
+
+      const included = await call(adminToken, `/api/months/1/members/${memberId}`, {
+        method: 'POST', headers: { Origin: authConfig.APP_ORIGIN },
+      })
+      expect(included.status).toBe(204)
+      expect(await db.prepare('SELECT * FROM month_members WHERE month_id = 1 AND member_id = ?')
+        .bind(memberId).first<MonthMember>()).toMatchObject({ payment_status: 'UNPAID', paid_at: null })
+      const final = await snapshot()
+      expect(final[1].filter((row) => row.id !== month.id)).toEqual(before[1])
+      expect(final[2].filter((row) => row.month_id !== month.id && row.member_id !== memberId)).toEqual(before[2])
+      expect(final[2].filter((row) => row.member_id === memberId).map((row) => row.month_id).sort((a, b) => a - b))
+        .toEqual([1, month.id])
+    })
+
+    it('rejects unauthenticated creation without inserting a member', async () => {
+      const before = await snapshot()
+      const response = await call(null, '/api/admin/members', {
+        method: 'POST', headers: { Origin: authConfig.APP_ORIGIN },
+        body: JSON.stringify({ name: 'Name', email: 'new@example.test' }),
+      })
+      expect(response.status).toBe(401)
+      expect(await snapshot()).toEqual(before)
+    })
+  })
+
   describe('GET /api/me', () => {
     it.each([
       ['admin@example.test', 1, 'Admin', 'ADMIN'],
@@ -144,7 +290,11 @@ describe('Access authentication and API authorization (real verifier and local D
       db.prepare('SELECT * FROM members ORDER BY id'),
       db.prepare('SELECT * FROM months ORDER BY id'),
       db.prepare('SELECT * FROM month_members ORDER BY id'),
-    ]).then((results) => results.map((result) => result.results))
+    ]).then((results) => [
+      results[0].results as Member[],
+      results[1].results as Month[],
+      results[2].results as MonthMember[],
+    ] as const)
   }
 
   it.each([null, '', 'not-a-jwt', 'a.b.c'])('rejects missing/malformed assertion %s before D1', async (token) => {

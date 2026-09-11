@@ -24,6 +24,20 @@ export async function updateMemberActiveStatus(
   return result.meta.changes === 1
 }
 
+export async function insertMember(
+  db: D1Database,
+  name: string,
+  email: string,
+): Promise<Pick<Member, 'id' | 'name'> | null> {
+  // Creation supplies a canonical email; UNIQUE(email) arbitrates concurrent inserts.
+  return db.prepare(`
+    INSERT INTO members (name, email)
+    VALUES (?, ?)
+    ON CONFLICT(email) DO NOTHING
+    RETURNING id, name
+  `).bind(name, email).first<Pick<Member, 'id' | 'name'>>()
+}
+
 export async function getMemberActiveStatus(
   db: D1Database,
   memberId: number,

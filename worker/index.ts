@@ -1,5 +1,6 @@
 import { authorize } from './auth'
 import type { AuthenticatedIdentity } from './auth'
+import { InvalidMemberInputError, MemberAlreadyExistsError } from './errors/members'
 import {
   InvalidMonthInputError,
   MemberAlreadyInMonthError,
@@ -14,7 +15,7 @@ import {
   MonthNotEditableError
 } from './errors/months'
 import { getAllMembers } from './repositories/members'
-import { setMemberActiveStatus } from './services/members'
+import { createMember, setMemberActiveStatus } from './services/members'
 import {
   calculateMonthAmount,
   closeMonth,
@@ -58,6 +59,39 @@ const api = {
       const members = await getAllMembers(env.DB)
 
       return Response.json(members)
+    }
+
+    if (url.pathname === '/api/admin/members' && request.method === 'POST') {
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return Response.json({ error: 'invalid JSON body' }, { status: 400 })
+      }
+
+      if (
+        typeof body !== 'object' || body === null ||
+        !('name' in body) || typeof body.name !== 'string' ||
+        !('email' in body) || typeof body.email !== 'string' ||
+        Object.keys(body).length !== 2
+      ) {
+        return Response.json({ error: 'expected only name and email as strings' }, { status: 400 })
+      }
+
+      try {
+        const member = await createMember(env.DB, { name: body.name, email: body.email })
+        return Response.json({ memberId: member.id, name: member.name }, { status: 201 })
+      } catch (error) {
+        if (error instanceof InvalidMemberInputError) {
+          return Response.json({ error: error.message }, { status: 400 })
+        }
+
+        if (error instanceof MemberAlreadyExistsError) {
+          return Response.json({ error: error.message }, { status: 409 })
+        }
+
+        throw error
+      }
     }
 
     const memberActiveMatch = url.pathname.match(/^\/api\/admin\/members\/([^/]+)\/active$/)

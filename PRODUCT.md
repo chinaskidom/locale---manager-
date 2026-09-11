@@ -60,6 +60,14 @@ The administrator must be able to create and manage months, enter the monthly bi
 
 Exact UI screens and endpoint shapes should follow the simplest architecture consistent with these requirements.
 
+### Member Creation
+
+- An authenticated administrator may create a member with only `name` and `email`, using the existing same-origin mutation protection. All other client-supplied fields are rejected.
+- Name and email are trimmed; empty names and empty/invalid emails are rejected. Email identities are unique after trimming and case-insensitive normalization, including concurrent creation requests. Provider-specific dot/plus normalization is not used.
+- New members are globally active by default. Creation does not change any existing DRAFT, PUBLISHED, or CLOSED month, its membership, payments, or quota.
+- Future newly-created months include the new active member through the existing snapshot behavior. Inclusion in an existing DRAFT month requires the separate explicit month-member inclusion operation.
+- Member creation does not update the Cloudflare Access whitelist; that remains separate deployment/administrative configuration.
+
 ## Payment Methods And Integrations
 
 - Bank transfer is an intended payment method; the receiving account is BBVA Italy.
